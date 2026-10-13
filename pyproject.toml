@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dbx-vocareum-tools"
+version = "0.1.0"
+description = "Operational tools for Vocareum-hosted Databricks labs"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = [
+    # The official SDK, used for OAuth machine-to-machine authentication and
+    # for the workspace and account APIs the probe walks. It is declared rather
+    # than hand-rolling the REST calls because the OAuth token exchange and its
+    # refresh are the part most worth not writing twice.
+    "databricks-sdk>=0.40",
+]
+
+[project.scripts]
+dbx-vocareum-diagnose = "dbx_vocareum_tools.diagnose:main"
+dbx-vocareum-init = "dbx_vocareum_tools.init:main"
+dbx-vocareum-orphans = "dbx_vocareum_tools.orphans:main"
+dbx-vocareum-pool = "dbx_vocareum_tools.pool:main"
+dbx-vocareum-probe = "dbx_vocareum_tools.probe:main"
+dbx-vocareum-session = "dbx_vocareum_tools.session:main"
+dbx-vocareum-upload = "dbx_vocareum_tools.upload:main"
+
+# The lab runtime and the hook template are data, not modules, and they are the
+# whole reason a course can depend on this package instead of vendoring it. Named
+# explicitly rather than left to the backend's defaults: a wheel built without
+# labruntime/*.sh installs cleanly, imports cleanly, and fails at the first
+# upload with a missing file, which is a long way from where the mistake was.
+[tool.hatch.build.targets.wheel]
+packages = ["src/dbx_vocareum_tools"]
+artifacts = [
+    "src/dbx_vocareum_tools/labruntime/*.sh",
+    "src/dbx_vocareum_tools/labruntime/*.py",
+    "src/dbx_vocareum_tools/labruntime/template/*",
+]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "docs", "probes", "README.md", "LICENSE", "pyproject.toml"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.12",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+# The workshop notebook is excluded rather than fixed. It runs on a Databricks
+# cluster, where `spark`, `dbutils`, and `display` are injected into the
+# namespace and read here as undefined names, and its prose lines are written
+# for a student reading them in a cell rather than for an 88-column rule.
+extend-exclude = ["notebooks", "*.ipynb"]
+
+[tool.ruff.lint]
+select = ["B", "C4", "E", "F", "I", "ISC", "PIE", "RUF", "SIM", "UP"]
+ignore = ["ISC001"]

@@ -1,0 +1,195 @@
+# Environment and secrets
+#
+# .env carries the live Databricks account ID, workspace IDs, the service
+# principal application ID and its OAuth secret. The committed documents under
+# docs/ write those as ${PLACEHOLDER} and resolve them from .env, so a fresh
+# clone is missing identifiers, never a conclusion. .env.example is the
+# committed template and is re-included below.
+.env
+.env.*
+!.env.example
+*.env
+
+# Credentials this repository must never carry: the service principal OAuth
+# secret, a Databricks personal access token, and the Vocareum API token.
+*.pat
+*.pem
+*.key
+databricks.cfg
+.databrickscfg
+vocareum-handoff-*.json
+secrets.json
+credentials.json
+
+# Private working notes and drafted requests to Vocareum support.
+support/
+*.local.md
+
+# Audit logs and run transcripts. Both record the Databricks account ID, the
+# workspace URL, and the operator's identity.
+*.log
+logs/
+probe-run-*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+.python-version
+
+# Test, coverage and type-checker caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.tox/
+.nox/
+.cache/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+htmlcov/
+nosetests.xml
+.hypothesis/
+
+# Jupyter and IPython
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+profile_default/
+ipython_config.py
+
+# Packaging and tooling
+*.manifest
+*.spec
+pip-log.txt
+pip-delete-this-directory.txt
+uv.lock.bak
+
+# VS Code
+#
+# The shared settings, launch configs, tasks and recommended extensions are
+# worth committing; everything else in .vscode/ is per-machine state.
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/extensions.json
+!.vscode/*.code-snippets
+.vscode-test/
+*.code-workspace
+.history/
+
+# AI assistant local settings
+.claude/
+
+# IntelliJ / PyCharm
+.idea/
+.idea_modules/
+*.iml
+*.ipr
+*.iws
+out/
+cmake-build-*/
+atlassian-ide-plugin.xml
+com_crashlytics_export_strings.xml
+
+# Other editors
+.vim/
+*.swp
+*.swo
+*~
+\#*\#
+.\#*
+.project
+.pydevproject
+.settings/
+.spyderproject
+.spyproject
+.ropeproject
+nbproject/
+
+# macOS
+.DS_Store
+.DS_Store?
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+Icon?
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Linux
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# Databricks CLI and bundle artifacts
+.databricks/
+.bundle/
+
+# Terraform, in case any workspace provisioning lands here
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+.terraform.lock.hcl
+
+# Node, in case any docs or dashboard tooling lands here
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Scratch and temporary files
+tmp/
+temp/
+scratch/
+*.tmp
+*.bak
+*.orig
+*.rej
+
+debug/

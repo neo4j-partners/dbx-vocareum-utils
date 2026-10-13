@@ -1,0 +1,78 @@
+[
+  {
+    "operation": "scim:Me",
+    "note": "Confirms which student this token belongs to. Read the identity guard's output before trusting anything below it."
+  },
+  {
+    "operation": "scim:ListUsers",
+    "note": "Whether a student can enumerate the course. Expected to be denied."
+  },
+  {
+    "operation": "scim:ListGroups",
+    "note": "Whether a student can see the Vocareum-managed group they are in."
+  },
+  {
+    "operation": "workspace:GetStatus",
+    "note": "Whether the workspace root is readable at all, which is the cheapest test of the workspace-access entitlement."
+  },
+  {
+    "operation": "workspace:List",
+    "note": "What the student sees on entry. Databricks filters this to what they may see, so a short list is not a small workspace."
+  },
+  {
+    "operation": "clusters:List",
+    "note": "Whether the student can see the compute user_setup.sh gave them. An empty list here with a cluster visible to the service principal means a missing grant."
+  },
+  {
+    "operation": "clusters:SparkVersions",
+    "note": "Bounds which Spark connector builds a course can install."
+  },
+  {
+    "operation": "clusters:ListNodeTypes",
+    "note": "Needed only if the student creates their own cluster rather than attaching to one."
+  },
+  {
+    "operation": "clusters:Get",
+    "note": "Names a cluster that does not exist. NOT_FOUND_OR_HIDDEN here proves nothing on its own; it is in the list to confirm the verdict is reachable."
+  },
+  {
+    "operation": "policies:List",
+    "note": "Whether the student can see the policy that caps what they can spend."
+  },
+  {
+    "operation": "libraries:AllClusterStatuses",
+    "note": "Whether the student can confirm the Spark connector is installed, which is the first thing they will ask when a connector call fails."
+  },
+  {
+    "operation": "secrets:ListScopes",
+    "note": "Whether the student can see a scope holding an external service's credentials. Seeing the scope is not reading the secret, and a course that connects out needs the second."
+  },
+  {
+    "operation": "unity-catalog:CurrentMetastore",
+    "note": "METASTORE_NOT_ASSIGNED here explains every Unity Catalog denial below it."
+  },
+  {
+    "operation": "unity-catalog:ListCatalogs",
+    "note": "Whether the student can reach the tables the course reads from Databricks."
+  },
+  {
+    "operation": "unity-catalog:ListExternalLocations",
+    "note": "Only needed for a course that writes to cloud storage directly."
+  },
+  {
+    "operation": "jobs:List",
+    "note": "Only needed for a course that runs something on a schedule."
+  },
+  {
+    "operation": "warehouses:List",
+    "note": "Only needed for a course that queries through SQL rather than a notebook."
+  },
+  {
+    "operation": "token:List",
+    "note": "Whether the student can mint the token this run is using. If this is denied, the token was made another way and the next operator cannot repeat the measurement."
+  },
+  {
+    "operation": "workspace-conf:Get",
+    "note": "Whether personal access tokens are enabled for the workspace at all."
+  }
+]
