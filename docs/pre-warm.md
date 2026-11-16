@@ -2,18 +2,19 @@
 
 ## The cost being attacked
 
-A student waits for a usable cluster in two phases. Two sessions measured them, each on one per-student cluster. The two are kept apart because the course attached its libraries differently in each.
+A student waits for a usable cluster in two phases. Three sessions measured them, each on one per-student cluster. They are kept apart because the course attached its libraries differently in the first.
 
-| Phase | Earlier session | Final test, no pool | What is happening |
-| --- | --- | --- | --- |
-| Create to `RUNNING` | 10 min | 508 s, about 8.5 min | Databricks asks AWS for an EC2 box, boots it, joins it to Spark |
-| `RUNNING` to all `INSTALLED` | 6 min | 142 s, about 2.4 min | Databricks installs the course's libraries |
-| Total | about 16 min | 650 s, about 11 min | |
+| Phase | Earlier session | Final test, no pool | Student session, no pool | What is happening |
+| --- | --- | --- | --- | --- |
+| Create to `RUNNING` | 10 min | 508 s, about 8.5 min | about 488 s, about 8 min | Databricks asks AWS for an EC2 box, boots it, joins it to Spark |
+| `RUNNING` to all `INSTALLED` | 6 min | 142 s, about 2.4 min | 125 s, about 2.1 min | Databricks installs the course's libraries |
+| Total | about 16 min | 650 s, about 11 min | about 613 s, about 10 min | |
 
 - **Earlier session:** The course named its libraries as a loose list: the Maven connector and ten `pypi:` entries.
 - **Final test:** A cluster policy held three libraries: the Maven connector, a 171-pin `requirements` lock at a `/Volumes` path, and a wheel at a `/Volumes` path. After `RUNNING`, Maven finished at about 60 seconds, the lock at about 120, and the wheel at about 142.
+- **Student session:** A student started session 1 with no pool. The cluster was created at 19:04:27 UTC and reached `RUNNING` at about 488 seconds. The same three libraries reported `INSTALLED` after `RUNNING`: Maven at 63 seconds, the `requirements` lock at 104, and the wheel at 125.
 
-The cluster reports `RUNNING` before its libraries are installed. That window was the last 6 minutes in the earlier session and the last 142 seconds in the final test. A student who trusts the state indicator gets import errors inside it.
+The cluster reports `RUNNING` before its libraries are installed. That window was the last 6 minutes in the earlier session, the last 142 seconds in the final test, and the last 125 seconds in the student session. A student who trusts the state indicator gets import errors inside it.
 
 ## What does not work: warming a cluster in `lab_setup.sh`
 

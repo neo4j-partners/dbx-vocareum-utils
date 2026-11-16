@@ -2438,6 +2438,12 @@ def token_probe(workspace: Workspace, source: str) -> dict:
             # halves of the question and a run can produce one without the other.
             fields["token_probe_identity_name"] = payload.get("userName") or "unknown"
             fields["token_probe_identity_id"] = str(payload.get("id") or "unknown")
+            # SCIM Me is a record, not a listing. A lab identity came back with
+            # "groups": [] and the empty-list rule above read it ALLOWED_EMPTY,
+            # though the principal was right there. A userName or id is the
+            # answer this call exists for, so either one earns ALLOWED.
+            if payload.get("userName") or payload.get("id"):
+                fields["token_probe_identity"] = "ALLOWED"
 
     log(
         "token-probe measured "

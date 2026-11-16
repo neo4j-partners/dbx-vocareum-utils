@@ -2486,6 +2486,41 @@ def test_token_probe_reports_the_identity_the_credential_carries():
     assert fields["token_probe_identity_id"] == "9911"
 
 
+def test_token_probe_reads_an_identity_with_no_groups_as_allowed():
+    # A real lab identity came back from SCIM Me with "groups": [], and the
+    # empty-list rule meant for list endpoints read that as ALLOWED_EMPTY. Me is
+    # not a listing: a userName or id is the answer, whatever else is empty.
+    client, _ = workspace(
+        token_probe_answers(
+            **{
+                "/api/2.0/preview/scim/v2/Me": {
+                    "userName": "labuser-example",
+                    "id": "4242",
+                    "groups": [],
+                }
+            }
+        )
+    )
+
+    fields = voclab.token_probe(client, "VOC_DB_API_TOKEN")
+
+    assert fields["token_probe_identity"] == "ALLOWED"
+    assert fields["token_probe_identity_name"] == "labuser-example"
+
+
+def test_token_probe_reads_an_identity_with_no_name_or_id_as_empty():
+    # The other side of the same rule. Allowed to ask and shown no principal is
+    # not an identity, and calling it ALLOWED would claim one was measured.
+    client, _ = workspace(
+        token_probe_answers(**{"/api/2.0/preview/scim/v2/Me": {"groups": []}})
+    )
+
+    fields = voclab.token_probe(client, "VOC_DB_API_TOKEN")
+
+    assert fields["token_probe_identity"] == "ALLOWED_EMPTY"
+    assert fields["token_probe_identity_name"] == "unknown"
+
+
 def test_token_probe_records_a_refusal_rather_than_raising():
     # The whole design decision, in one test. A denied call is the answer.
     client, _ = workspace(
