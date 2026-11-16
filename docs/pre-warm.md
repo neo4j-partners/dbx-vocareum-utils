@@ -2,14 +2,18 @@
 
 ## The cost being attacked
 
-A student waits about 16 minutes for a usable cluster. Measured on one per-student cluster:
+A student waits for a usable cluster in two phases. Two sessions measured them, each on one per-student cluster. The two are kept apart because the course attached its libraries differently in each.
 
-| Phase | Time | What is happening |
-| --- | --- | --- |
-| Create to `RUNNING` | 10 min | Databricks asks AWS for an EC2 box, boots it, joins it to Spark |
-| `RUNNING` to all `INSTALLED` | 6 min | Maven resolves a Spark connector, pip installs ten packages |
+| Phase | Earlier session | Final test, no pool | What is happening |
+| --- | --- | --- | --- |
+| Create to `RUNNING` | 10 min | 508 s, about 8.5 min | Databricks asks AWS for an EC2 box, boots it, joins it to Spark |
+| `RUNNING` to all `INSTALLED` | 6 min | 142 s, about 2.4 min | Databricks installs the course's libraries |
+| Total | about 16 min | 650 s, about 11 min | |
 
-The cluster reports `RUNNING` for the last 6 of those minutes, so a student who trusts the state indicator gets import errors.
+- **Earlier session:** The course named its libraries as a loose list: the Maven connector and ten `pypi:` entries.
+- **Final test:** A cluster policy held three libraries: the Maven connector, a 171-pin `requirements` lock at a `/Volumes` path, and a wheel at a `/Volumes` path. After `RUNNING`, Maven finished at about 60 seconds, the lock at about 120, and the wheel at about 142.
+
+The cluster reports `RUNNING` before its libraries are installed. That window was the last 6 minutes in the earlier session and the last 142 seconds in the final test. A student who trusts the state indicator gets import errors inside it.
 
 ## What does not work: warming a cluster in `lab_setup.sh`
 
@@ -23,7 +27,7 @@ Fixing the permission grant that failed during pre-warm buys none of this back. 
 
 ## What can work: an instance pool
 
-An instance pool is a Databricks object, not an AWS object. It keeps N booted EC2 boxes on standby. A cluster that names the pool grabs a ready box instead of waiting for AWS. That attacks the 10 minutes. It does nothing to the 6.
+An instance pool is a Databricks object, not an AWS object. It keeps N booted EC2 boxes on standby. A cluster that names the pool grabs a ready box instead of waiting for AWS. That attacks the wait for `RUNNING`, which was 10 minutes in the earlier session and 508 seconds in the final test. It does nothing to the library installs that follow.
 
 The pool needs no student identity, which is why it dodges the bug above.
 
@@ -106,6 +110,6 @@ Three things to know:
 
 ## Still open
 
-- **How much time a pool really saves.** Pools preload runtimes, not libraries, so the 6 minutes of installs stay. The drop from 16 minutes to about 7 is arithmetic, not an observation.
+- **How much time a pool really saves.** Pools preload runtimes, not libraries, so the installs stay. On the earlier session's figures, the drop from 16 minutes to about 7 is arithmetic, not an observation. On the final test's figures, the installs take 142 seconds after `RUNNING`. How long a pooled cluster takes to reach `RUNNING` is not measured, so no new total is given.
 - **Whether `min_idle_instances` holds when a whole class starts at once.** The pool sits in one availability zone, so this is a question about capacity in that zone rather than in the region.
 - **Whether Vocareum reuses a part's workspace between classes.** A pool dies with its workspace, so the pool is per class rather than per course until this is measured.

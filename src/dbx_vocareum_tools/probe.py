@@ -78,6 +78,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -960,6 +961,15 @@ def resolve_probe(name: str) -> Probe:
     return Probe(name=name, operation=CATALOG.get(name))
 
 
+# A brace token left in a probe path, ``${NAME}`` or ``{name}``, other than the
+# one ``{account_id}`` this tool fills in. A probes file can be a copy-and-fill
+# template, and an unfilled one is worse than a broken one: the literal token
+# goes to Databricks, the path answers 404, and that reads as
+# NOT_FOUND_OR_HIDDEN. For a probe whose whole point is whether a principal can
+# be found, that is the finding itself, reported for a path that named nobody.
+UNFILLED_PLACEHOLDER = re.compile(r"\$\{[^{}]*\}|\{(?!account_id\})[^{}]*\}")
+
+
 def load_probes_file(path: Path) -> list[Probe]:
     """Load a JSON list of probe definitions.
 
@@ -989,6 +999,14 @@ def load_probes_file(path: Path) -> list[Probe]:
         if "path" not in entry:
             probes.append(resolve_probe(name))
             continue
+        unfilled = UNFILLED_PLACEHOLDER.search(str(entry["path"]))
+        if unfilled:
+            raise ConfigError(
+                f"Probe {name!r} in {path} has the unfilled placeholder "
+                f"{unfilled.group(0)} in its path. That file is a template: copy "
+                "it, replace the placeholder with a real value, and point "
+                "--probes-file at the copy. Only {account_id} is filled in here."
+            )
         scope = str(entry.get("scope", WORKSPACE_SCOPE))
         if scope not in {WORKSPACE_SCOPE, ACCOUNT_SCOPE}:
             raise ConfigError(

@@ -278,13 +278,18 @@ class Observations:
     workspace_user_id: str = ""
     account_group_id: str = ""
     workspace_group_id: str = ""
-    # What --expect found, as three disjoint lists of "kind name" strings. Three
+    # What --expect found, as disjoint lists of "kind name" strings. Lists
     # rather than a pass flag, because "absent" and "could not be read" send a
     # reader to two different places, and a gate that reported them as one
     # number would be the same gate the beacon already failed to be.
     expected_present: list[str] = field(default_factory=list)
     expected_missing: list[str] = field(default_factory=list)
     expected_unchecked: list[str] = field(default_factory=list)
+    # Present but not doing its job yet, which only a library policy reports: a
+    # policy whose libraries have not installed on the clusters carrying it. A
+    # fourth list rather than a slot in "missing", because that would send the
+    # reader to create a policy that is already there.
+    expected_not_ready: list[str] = field(default_factory=list)
     # Whether the manifest was read and its lookups were run at all. Without
     # this, a manifest that fails to parse and a workspace that was never
     # reached both leave the three lists empty, and empty reads as "nothing
@@ -971,11 +976,24 @@ def read_compute(client: WorkspaceClient, observations: Observations) -> None:
     print(f"Clusters visible: {len(clusters)}")
 
     email = observations.lab_user_email
+    wanted = email.casefold()
     for cluster in clusters[:MAX_LISTED]:
         creator = str(cluster.get("creator_user_name", ""))
         name = str(cluster.get("cluster_name", ""))
         state = str(cluster.get("state", ""))
-        mine = bool(email) and (creator == email or email in name)
+        # single_user_name is the check that matters for voclab.py's clusters.
+        # cluster-ensure names one after the local part of the email only, and
+        # the service principal creates it, so the other two checks both miss.
+        # A live session printed "No compute belongs to the lab user" for a
+        # cluster assigned to the student. Compared casefolded, because the
+        # session record and the cluster record need not agree on case, and a
+        # case mismatch fails silently here.
+        assigned = str(cluster.get("single_user_name", ""))
+        mine = bool(email) and (
+            creator.casefold() == wanted
+            or assigned.casefold() == wanted
+            or wanted in name.casefold()
+        )
         if mine:
             observations.clusters_for_user.append(name)
         print(f"  {'*' if mine else ' '} {name}  {state}  created by {creator}")
@@ -1475,7 +1493,10 @@ def read_principals(
 
 
 def read_expectations(
-    client: WorkspaceClient | None, manifest: Path, observations: Observations
+    client: WorkspaceClient | None,
+    manifest: Path,
+    observations: Observations,
+    workspace_id: str = "",
 ) -> None:
     """Check the objects a course says its hooks build, and report each one.
 
@@ -1495,7 +1516,7 @@ def read_expectations(
         return
 
     try:
-        expectations = load_manifest(manifest)
+        expectations = load_manifest(manifest, workspace_id)
     except ManifestError as error:
         print(f"The manifest was not read.\n{error}")
         return
@@ -1510,18 +1531,21 @@ def read_expectations(
 def gate_failed(observations: Observations) -> bool:
     """Whether a ``--expect`` run should exit non-zero.
 
-    Three ways to fail and only one way to pass, which is the asymmetry the
+    Several ways to fail and only one way to pass, which is the asymmetry the
     whole gate rests on. An object that is absent fails for the obvious reason.
     An object that could not be looked up fails because a gate passing on "the
     call did not complete" would pass on a revoked credential, and that is the
     one failure every check in a run is most likely to share. A manifest that
     never ran fails because empty lists otherwise read as nothing missing, so
-    the gate would pass hardest exactly when it measured least.
+    the gate would pass hardest exactly when it measured least. A library
+    policy that is present but not ready fails too, because a lab whose first
+    import fails did not come up.
     """
     return bool(
         not observations.expectations_checked
         or observations.expected_missing
         or observations.expected_unchecked
+        or observations.expected_not_ready
     )
 
 
@@ -1535,6 +1559,8 @@ def record_expectation(result: Result, observations: Observations) -> None:
         observations.expected_present.append(label)
     elif result.presence is Presence.ABSENT_OR_HIDDEN:
         observations.expected_missing.append(label)
+    elif result.presence is Presence.NOT_READY:
+        observations.expected_not_ready.append(label)
     else:
         observations.expected_unchecked.append(label)
 
@@ -1892,6 +1918,22 @@ def interpret(observations: Observations) -> list[Finding]:
             )
         )
 
+    if observations.expected_not_ready:
+        findings.append(
+            Finding(
+                "The course's libraries are not ready on the student clusters",
+                f"Not ready: {', '.join(observations.expected_not_ready)}.",
+                "The policy exists, and the detail printed beside it in step 5C "
+                "says which cluster and which library. A library that FAILED or "
+                "was SKIPPED will not arrive on its own: fix the coordinate in "
+                "VOC_COURSE_LIBRARIES and redeploy. PENDING or INSTALLING is a "
+                "cluster still starting, so run the gate again in a few minutes. "
+                "A library that is not listed at all on a cluster carrying the "
+                "policy is the open question of whether a policy edit reaches a "
+                "cluster that already exists.",
+            )
+        )
+
     if observations.expected_unchecked:
         findings.append(
             Finding(
@@ -1914,7 +1956,8 @@ def interpret(observations: Observations) -> list[Finding]:
         findings.append(
             Finding(
                 "No compute belongs to the lab user",
-                f"No cluster names or is owned by {observations.lab_user_email}.",
+                f"No cluster names, is owned by, or is assigned to "
+                f"{observations.lab_user_email}.",
                 "Expected when the lab hands the student a shared or serverless "
                 "cluster. A problem when user_setup.sh is meant to create one: "
                 "check the allow-cluster-create entitlement on the group, and "
@@ -2055,7 +2098,12 @@ def run_diagnostic(config: Config, args: argparse.Namespace) -> int:
         read_principals(client, config, observations)
 
     if args.expect is not None:
-        read_expectations(client, args.expect.expanduser(), observations)
+        read_expectations(
+            client,
+            args.expect.expanduser(),
+            observations,
+            workspace_id_for(client, config) if client is not None else "",
+        )
 
     report(observations, interpret(observations))
 

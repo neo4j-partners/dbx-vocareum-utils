@@ -30,6 +30,11 @@ page. Both families answered:
   schemas, tables, volumes, and workspace paths.
 - list-and-match, one GET returning a page that has to be searched: SQL
   warehouses, pipelines, and Genie spaces.
+
+A library policy is the one kind that is more than a lookup. The policy existing
+says nothing about whether a student can import anything, so the check follows
+it onto the clusters that carry it and reads each one's library status. See
+``_check_library_policy``.
 """
 
 from __future__ import annotations
@@ -65,6 +70,13 @@ class Presence(StrEnum):
     PRESENT = "present"
     ABSENT_OR_HIDDEN = "absent or hidden"
     NOT_CHECKED = "not checked"
+    # The object is there and is not yet doing its job. Used by the library
+    # policy only: a policy found by name whose libraries have not installed on
+    # the clusters that carry it. Its own value rather than PRESENT, because a
+    # lab whose first import fails is not a lab that came up. Its own value
+    # rather than ABSENT_OR_HIDDEN, because that sends a reader to create a
+    # policy that already exists.
+    NOT_READY = "present, not ready"
 
 
 @dataclass(frozen=True)
@@ -109,10 +121,14 @@ MANIFEST_KEYS = {
     "pipelines": "pipeline",
     "genie_spaces": "genie space",
     "workspace_paths": "workspace path",
+    "library_policies": "library policy",
 }
 
 
-def load_manifest(path: Path) -> list[Expectation]:
+WORKSPACE_ID_PLACEHOLDER = "${WORKSPACE_ID}"
+
+
+def load_manifest(path: Path, workspace_id: str = "") -> list[Expectation]:
     """Read a course's manifest into a flat list of expectations.
 
     The file is JSON holding one object whose keys are drawn from
@@ -127,6 +143,12 @@ def load_manifest(path: Path) -> list[Expectation]:
     An unknown key is an error rather than something to skip. A misspelled key
     that is quietly ignored is an expectation nobody checks, and the gate reports
     a pass it never measured, which is worse than having no gate.
+
+    A name may hold ``${WORKSPACE_ID}``, which becomes ``workspace_id``. A course
+    whose schemas are named for the workspace, because every workspace of a class
+    shares one metastore, cannot write those names down in advance. With no
+    workspace ID to put in, the manifest is refused: checking the literal text
+    would report absence of an object nobody ever meant to create.
     """
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -156,7 +178,16 @@ def load_manifest(path: Path) -> list[Expectation]:
         for name in names:
             if not isinstance(name, str) or not name.strip():
                 raise ManifestError(f"{path}: {key} holds a name that is not text.")
-            expectations.append(Expectation(kind=kind, name=name.strip()))
+            name = name.strip()
+            if WORKSPACE_ID_PLACEHOLDER in name:
+                if not workspace_id:
+                    raise ManifestError(
+                        f"{path}: {name} needs a workspace ID and none is known. "
+                        "Set DATABRICKS_WORKSPACE_ID or let the workspace read "
+                        "resolve it."
+                    )
+                name = name.replace(WORKSPACE_ID_PLACEHOLDER, workspace_id)
+            expectations.append(Expectation(kind=kind, name=name))
 
     if not expectations:
         raise ManifestError(
@@ -197,6 +228,15 @@ NAME_FIELDS = ("name", "title", "display_name")
 
 WORKSPACE_STATUS_PATH = "/api/2.0/workspace/get-status"
 
+CLUSTER_POLICIES_PATH = "/api/2.0/policies/clusters/list"
+CLUSTERS_PATH = "/api/2.0/clusters/list"
+LIBRARY_STATUS_PATH = "/api/2.0/libraries/cluster-status"
+
+# A cluster in one of these states is up or on its way up. The same set
+# voclab.py uses, restated because the lab runtime is package data and cannot be
+# imported from here.
+LIVE_CLUSTER_STATES = frozenset({"RUNNING", "PENDING", "RESIZING", "RESTARTING"})
+
 
 def check(client: WorkspaceClient, expectation: Expectation) -> Result:
     """Look one expectation up and say what came back."""
@@ -212,6 +252,8 @@ def check(client: WorkspaceClient, expectation: Expectation) -> Result:
         )
     if expectation.kind in LIST_AND_MATCH:
         return _list_and_match(client, expectation)
+    if expectation.kind == "library policy":
+        return _check_library_policy(client, expectation)
     return Result(
         expectation,
         Presence.NOT_CHECKED,
@@ -279,6 +321,164 @@ def _list_and_match(client: WorkspaceClient, expectation: Expectation) -> Result
         expectation,
         Presence.ABSENT_OR_HIDDEN,
         "no object of that kind in this workspace carries that name",
+    )
+
+
+class _Unreadable(Exception):
+    """A listing that answered but could not be read to the end."""
+
+
+def _library_key(library: Any) -> str:
+    """A stable identity for a library specification, for comparing two lists."""
+    return json.dumps(library, sort_keys=True)
+
+
+def _library_label(library: Any) -> str:
+    """Name a library the way ``VOC_COURSE_LIBRARIES`` would, for a detail line."""
+    if isinstance(library, dict) and len(library) == 1:
+        kind, value = next(iter(library.items()))
+        if isinstance(value, dict):
+            value = value.get("package") or value.get("coordinates")
+        if isinstance(value, str) and value:
+            return f"{kind}:{value}"
+    return _library_key(library)
+
+
+def _list_clusters(client: WorkspaceClient) -> list[dict[str, Any]]:
+    """Every cluster in the workspace, following ``next_page_token``.
+
+    Every page, because a class of students is one cluster each, and a page
+    boundary that hid half of them would pass the gate on the half it read.
+    """
+    clusters: list[dict[str, Any]] = []
+    query: dict[str, Any] | None = None
+    seen: set[str] = set()
+    while True:
+        payload = client.api_client.do("GET", CLUSTERS_PATH, query=query)
+        if not isinstance(payload, dict):
+            raise _Unreadable("clusters/list was not a JSON object")
+        clusters.extend(c for c in payload.get("clusters") or [] if isinstance(c, dict))
+        token = payload.get("next_page_token")
+        if not token:
+            return clusters
+        if token in seen:
+            raise _Unreadable("clusters/list returned the same page token twice")
+        seen.add(token)
+        query = {"page_token": token}
+
+
+def _cluster_problems(
+    client: WorkspaceClient, cluster: dict[str, Any], libraries: list[Any]
+) -> list[str]:
+    """Say what is wrong with one cluster's libraries, or nothing if all installed.
+
+    A cluster that is not RUNNING is reported as such and not read. Nothing has
+    installed on a cluster that is still starting, so reading it would only say
+    PENDING at greater cost.
+    """
+    name = cluster.get("cluster_name") or cluster.get("cluster_id") or "a cluster"
+    state = cluster.get("state") or "UNKNOWN"
+    if state != "RUNNING":
+        return [f"{name} is {state}"]
+    payload = client.api_client.do(
+        "GET", LIBRARY_STATUS_PATH, query={"cluster_id": cluster.get("cluster_id")}
+    )
+    statuses = {
+        _library_key(entry.get("library")): entry
+        for entry in (payload or {}).get("library_statuses") or []
+        if isinstance(entry, dict)
+    }
+    problems = []
+    for library in libraries:
+        entry = statuses.get(_library_key(library))
+        if entry is None:
+            problems.append(f"{name}: {_library_label(library)} not listed")
+            continue
+        status = entry.get("status") or "UNKNOWN"
+        if status != "INSTALLED":
+            messages = entry.get("messages") or []
+            first = str(messages[0]).splitlines()[0] if messages else ""
+            reason = f" ({first})" if first else ""
+            problems.append(f"{name}: {_library_label(library)} {status}{reason}")
+    return problems
+
+
+def _check_library_policy(client: WorkspaceClient, expectation: Expectation) -> Result:
+    """Follow a library policy onto the clusters that carry it.
+
+    ``PRESENT`` only when every library the policy names is ``INSTALLED`` on
+    every RUNNING cluster carrying it, and at least one live cluster does.
+    ``NOT_READY`` covers a policy naming no libraries, no live cluster carrying
+    the policy, a cluster still starting, and a library that is pending, failed,
+    or not listed. Absence of the policy itself is ``ABSENT_OR_HIDDEN`` and a
+    failed call is ``NOT_CHECKED``, as for every other kind.
+
+    Matching a cluster to the policy reads ``policy_id`` off ``clusters/list``.
+    Whether that listing reports ``policy_id`` is unmeasured. If it does not,
+    this reads as no cluster carrying the policy, and the detail says so rather
+    than calling the gap a fault in the lab.
+
+    Measured 2026-11-16: the policy listing returns a ``libraries`` key when
+    the policy has libraries and omits it when it has none, and a policy's
+    libraries appear in ``libraries/cluster-status`` as PENDING and then
+    INSTALLED.
+    """
+    try:
+        payload = client.api_client.do("GET", CLUSTER_POLICIES_PATH)
+        policy = next(
+            (
+                item
+                for item in (payload or {}).get("policies") or []
+                if isinstance(item, dict) and item.get("name") == expectation.name
+            ),
+            None,
+        )
+        if policy is None:
+            return Result(
+                expectation,
+                Presence.ABSENT_OR_HIDDEN,
+                "no cluster policy in this workspace carries that name",
+            )
+        libraries = policy.get("libraries") or []
+        if not libraries:
+            return Result(
+                expectation, Presence.NOT_READY, "the policy names no libraries"
+            )
+
+        policy_id = policy.get("policy_id")
+        carrying = [
+            cluster
+            for cluster in _list_clusters(client)
+            if cluster.get("policy_id") == policy_id
+            and cluster.get("state") in LIVE_CLUSTER_STATES
+        ]
+        if not carrying:
+            return Result(
+                expectation,
+                Presence.NOT_READY,
+                "no running or starting cluster carries this policy, so no "
+                "student has its libraries. Run the gate while a student's "
+                "session is live",
+            )
+
+        problems = [
+            problem
+            for cluster in carrying
+            for problem in _cluster_problems(client, cluster, libraries)
+        ]
+    except DatabricksError as error:
+        return Result(
+            expectation, Presence.NOT_CHECKED, redact_text(error_pair(error)[1])
+        )
+    except (RequestException, _Unreadable) as error:
+        return Result(expectation, Presence.NOT_CHECKED, redact_text(str(error)))
+
+    if problems:
+        return Result(expectation, Presence.NOT_READY, "; ".join(problems))
+    return Result(
+        expectation,
+        Presence.PRESENT,
+        f"{len(libraries)} libraries installed on {len(carrying)} cluster(s)",
     )
 
 

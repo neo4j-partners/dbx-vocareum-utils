@@ -33,13 +33,16 @@ from dbx_vocareum_tools.diagnose import (
     interpret,
     normalize_host_or_blank,
     read_beacon,
+    read_compute,
     read_expectations,
     read_user_folder,
     read_vocareum_workspace,
+    record_expectation,
     report_custom_data,
     scim_lookup,
     session_has_started,
 )
+from dbx_vocareum_tools.expect import Expectation, Presence, Result
 
 
 class ExpectStub:
@@ -234,6 +237,39 @@ def test_a_folder_that_could_not_be_read_is_left_unmeasured(error: Exception) ->
     read_user_folder(FailingClient(error), observations)
     assert observations.user_folder_exists is None
     assert "The lab user has no visible workspace folder" not in labels(observations)
+
+
+def test_a_cluster_assigned_to_the_student_is_theirs() -> None:
+    """Attribution reads single_user_name, case-insensitively.
+
+    Shaped like the cluster voclab.py's cluster-ensure creates: named after the
+    email's local part with no domain, created by the service principal, and
+    assigned to the student. A live session reported no compute for exactly this
+    cluster. The second cluster is the control: assigned to someone else, it
+    must stay unattributed.
+    """
+    observations = healthy()
+    observations.clusters_for_user = []
+    clusters = [
+        {
+            "cluster_name": "student1_200000",
+            "creator_user_name": "00000000-0000-0000-0000-000000000000",
+            "single_user_name": STUDENT.upper(),
+            "state": "RUNNING",
+        },
+        {
+            "cluster_name": "student2_200001",
+            "creator_user_name": "00000000-0000-0000-0000-000000000000",
+            "single_user_name": "student2_200001@vocareum.com",
+            "state": "RUNNING",
+        },
+    ]
+    stub = ExpectStub({"/api/2.0/clusters/list": {"clusters": clusters}})
+
+    read_compute(stub, observations)
+
+    assert observations.clusters_for_user == ["student1_200000"]
+    assert "No compute belongs to the lab user" not in labels(observations)
 
 
 def test_workspace_findings_are_suppressed_when_the_workspace_was_not_read() -> None:
@@ -981,3 +1017,24 @@ def test_the_gate_passes_only_when_every_object_read_back() -> None:
 def test_the_gate_fails_three_ways(observations: Observations) -> None:
     """Absent, unreadable, and never ran. Only the first is about the lab."""
     assert gate_failed(observations)
+
+
+def test_a_library_policy_not_ready_is_filed_apart_and_fails_the_gate() -> None:
+    # Not "missing", which would send the reader to create a policy that is
+    # already there, and not "unchecked", because the read succeeded.
+    observations = Observations(expectations_checked=True)
+    result = Result(
+        Expectation("library policy", "voc-course-libraries"),
+        Presence.NOT_READY,
+        "student_1: pypi:neo4j==6.2.0 PENDING",
+    )
+
+    record_expectation(result, observations)
+
+    assert observations.expected_not_ready == ["library policy voc-course-libraries"]
+    assert observations.expected_missing == []
+    assert observations.expected_unchecked == []
+    assert gate_failed(observations)
+    assert "The course's libraries are not ready on the student clusters" in labels(
+        observations
+    )

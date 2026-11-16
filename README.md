@@ -226,7 +226,7 @@ uv run dbx-vocareum-pool --env-file "$VOC_ENV"                    # read only
 uv run dbx-vocareum-pool --create --min-idle 5 --env-file "$VOC_ENV"
 ```
 
-A student waits about 16 minutes for a cluster. An instance pool keeps booted machines on standby, so the wait drops. Idle machines bill from create to delete. [`docs/pre-warm.md`](docs/pre-warm.md) covers the flags and what was measured.
+A student waits about 11 to 16 minutes for a cluster without a pool. An instance pool keeps booted machines on standby, so the wait drops. Idle machines bill from create to delete. [`docs/pre-warm.md`](docs/pre-warm.md) covers the flags and what was measured.
 
 ### During class
 
@@ -315,7 +315,7 @@ uv run dbx-vocareum-diagnose --expect expected.json
 
 `--expect` reads a course's manifest, looks up every object it names, and exits `3` if any is missing. It exists because a hook's own report does not reach the API on a Databricks part. Measured on one part, the hooks ran and the cluster and notebook existed, yet the session record had no `voccustomdata` key. So the gate checks the workspace instead.
 
-The manifest belongs to the course. It is one JSON object. Its keys are `catalogs`, `schemas`, `tables`, `volumes`, `warehouses`, `pipelines`, `genie_spaces`, and `workspace_paths`. Each holds a list of names in the form that kind of object uses.
+The manifest belongs to the course. It is one JSON object. Its keys are `catalogs`, `schemas`, `tables`, `volumes`, `warehouses`, `pipelines`, `genie_spaces`, `workspace_paths`, and `library_policies`. Each holds a list of names in the form that kind of object uses.
 
 ```json
 {
@@ -332,6 +332,7 @@ The manifest belongs to the course. It is one JSON object. Its keys are `catalog
 - **`PRESENT`:** This is the only result that passes.
 - **`ABSENT_OR_HIDDEN`:** This fails. Databricks tells a caller with no permission that the object does not exist, so absent and hidden look the same.
 - **`NOT_CHECKED`:** This fails too. A gate that passed when a call did not finish would pass on a revoked credential.
+- **`NOT_READY`:** This fails. Only a library policy reports it. The policy exists, but its libraries are not all `INSTALLED` on every running cluster that carries it.
 - **Unparsed manifest:** This fails, because empty lists would otherwise read as nothing missing.
 - **What it does not cover:** The gate reads the shared workspace. Whether a student got their cluster and notebooks is checked by launching a session, as in step 9.
 
@@ -387,6 +388,7 @@ A Vocareum Databricks lab has two principals, and they are far apart.
 | Find out why a lab came up empty | [`docs/diagnosing.md`](docs/diagnosing.md) |
 | Cut how long a student waits for compute | [`docs/pre-warm.md`](docs/pre-warm.md) |
 | Call the Vocareum REST API from code | [`docs/vocareum-api.md`](docs/vocareum-api.md) |
+| Connect a lab to Neo4j Aura, and keep its credentials out of notebook text | [`docs/neo4j-aura.md`](docs/neo4j-aura.md) |
 
 ## Files
 
@@ -394,6 +396,9 @@ A Vocareum Databricks lab has two principals, and they are far apart.
 | --- | --- |
 | `docs/` | The reference documents linked above |
 | `probes/` | Probe lists for `dbx-vocareum-probe --probes-file`. `lab-user.json` is the set to run inside a live student session |
+| `probes/principal-not-found.json` | A copy-and-fill template for the account and workspace identity planes. The probe refuses it until its placeholders are replaced |
+| `notebooks/` | No notebooks. Its README records the two Vocareum routes for a notebook and why neither is used |
+| `scripts/` | `uv run` wrappers that run a tool by path, such as `scripts/probe_lab.py`. Every command except `dbx-vocareum-init` has one |
 | `src/dbx_vocareum_tools/` | The installable Python package behind the seven commands |
 | `src/dbx_vocareum_tools/labruntime/` | What runs inside Vocareum: the shared runtime `voclib.sh` and `voclab.py`, and the `template/` that `dbx-vocareum-init` copies into a course |
 | `tests/` | Offline tests. No test makes a network call |

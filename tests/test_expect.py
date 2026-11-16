@@ -255,3 +255,262 @@ def test_every_expectation_is_checked_and_the_order_is_kept() -> None:
         Presence.ABSENT_OR_HIDDEN,
     ]
     assert [result.expectation for result in results] == expectations
+
+
+def test_the_workspace_id_placeholder_is_filled_in(tmp_path: Path) -> None:
+    path = write(
+        tmp_path,
+        {"schemas": ["workshop.aircraft_gold_${WORKSPACE_ID}", "workshop.agents"]},
+    )
+
+    assert load_manifest(path, "123") == [
+        Expectation("schema", "workshop.aircraft_gold_123"),
+        Expectation("schema", "workshop.agents"),
+    ]
+
+
+def test_the_placeholder_without_a_workspace_id_is_refused(tmp_path: Path) -> None:
+    # Checking the literal text would report an object absent that nobody ever
+    # meant to create, and send the reader to build it.
+    path = write(tmp_path, {"schemas": ["workshop.aircraft_gold_${WORKSPACE_ID}"]})
+
+    with pytest.raises(ManifestError, match="needs a workspace ID"):
+        load_manifest(path)
+
+
+# ---------------------------------------------------------------------------
+# The library policy, which is followed onto the clusters that carry it
+# ---------------------------------------------------------------------------
+
+POLICY_NAME = "voc-course-libraries"
+POLICY_ID = "ABC123POLICY"
+LIBRARIES = [
+    {"pypi": {"package": "neo4j==6.2.0"}},
+    {"maven": {"coordinates": "org.neo4j:neo4j-connector-apache-spark_2.13:5.4.3"}},
+]
+POLICIES_PATH = "/api/2.0/policies/clusters/list"
+CLUSTERS_PATH = "/api/2.0/clusters/list"
+STATUS_PATH = "/api/2.0/libraries/cluster-status"
+
+
+class PagedStub(Stub):
+    """A Stub whose answer for a path may depend on the query it was sent with.
+
+    A value that is a dict keyed by a frozen query answers per query, so one
+    path can hand back a first page and a second page.
+    """
+
+    def do(self, method: str, path: str, query: dict[str, Any] | None = None) -> Any:
+        answer = self.answers.get(path)
+        if isinstance(answer, PerQuery):
+            self.calls.append((path, query))
+            result = answer.get(frozenset((query or {}).items()), not_found(path))
+            if isinstance(result, Exception):
+                raise result
+            return result
+        return super().do(method, path, query)
+
+
+class PerQuery(dict):
+    """Answers for one path, keyed by the query's items as a frozenset."""
+
+
+def policy(libraries: list[Any] | None = None) -> dict[str, Any]:
+    entry: dict[str, Any] = {"name": POLICY_NAME, "policy_id": POLICY_ID}
+    if libraries is None:
+        libraries = LIBRARIES
+    if libraries:
+        entry["libraries"] = libraries
+    return entry
+
+
+def cluster(
+    cluster_id: str = "0101-abc", state: str = "RUNNING", policy_id: str = POLICY_ID
+) -> dict[str, Any]:
+    return {
+        "cluster_id": cluster_id,
+        "cluster_name": f"student_{cluster_id}",
+        "state": state,
+        "policy_id": policy_id,
+    }
+
+
+def statuses(*pairs: tuple[Any, str]) -> dict[str, Any]:
+    return {
+        "library_statuses": [
+            {"library": library, "status": status} for library, status in pairs
+        ]
+    }
+
+
+def library_policy_stub(
+    clusters: list[dict[str, Any]], status_by_cluster: dict[str, Any]
+) -> PagedStub:
+    return PagedStub(
+        {
+            POLICIES_PATH: {"policies": [policy()]},
+            CLUSTERS_PATH: {"clusters": clusters},
+            STATUS_PATH: PerQuery(
+                {
+                    frozenset({("cluster_id", cid)}): answer
+                    for cid, answer in status_by_cluster.items()
+                }
+            ),
+        }
+    )
+
+
+EXPECTED = Expectation("library policy", POLICY_NAME)
+
+
+def test_the_manifest_takes_library_policies(tmp_path: Path) -> None:
+    path = write(tmp_path, {"library_policies": [POLICY_NAME]})
+
+    assert load_manifest(path) == [EXPECTED]
+
+
+def test_a_policy_whose_libraries_all_installed_reads_as_present() -> None:
+    client = library_policy_stub(
+        [cluster()],
+        {"0101-abc": statuses(*((lib, "INSTALLED") for lib in LIBRARIES))},
+    )
+
+    result = check(client, EXPECTED)
+
+    assert result.presence is Presence.PRESENT
+    assert result.satisfied
+
+
+def test_an_absent_policy_reads_as_absent_or_hidden() -> None:
+    client = PagedStub({POLICIES_PATH: {"policies": []}})
+
+    assert check(client, EXPECTED).presence is Presence.ABSENT_OR_HIDDEN
+
+
+def test_a_policy_naming_no_libraries_is_not_ready() -> None:
+    # Measured: a policy without libraries omits the key from the listing.
+    client = PagedStub({POLICIES_PATH: {"policies": [policy([])]}})
+
+    result = check(client, EXPECTED)
+
+    assert result.presence is Presence.NOT_READY
+    assert not result.satisfied
+
+
+@pytest.mark.parametrize(
+    "status, shown",
+    [
+        ("PENDING", "PENDING"),
+        ("FAILED", "FAILED (Library resolution failed.)"),
+        ("SKIPPED", "SKIPPED"),
+    ],
+)
+def test_a_library_not_installed_is_not_ready_and_named(
+    status: str, shown: str
+) -> None:
+    entry: dict[str, Any] = {"library": LIBRARIES[1], "status": status}
+    if status == "FAILED":
+        entry["messages"] = ["Library resolution failed.\nat line 1"]
+    client = library_policy_stub(
+        [cluster()],
+        {
+            "0101-abc": {
+                "library_statuses": [
+                    {"library": LIBRARIES[0], "status": "INSTALLED"},
+                    entry,
+                ]
+            }
+        },
+    )
+
+    result = check(client, EXPECTED)
+
+    assert result.presence is Presence.NOT_READY
+    assert f"maven:org.neo4j:neo4j-connector-apache-spark_2.13:5.4.3 {shown}" in (
+        result.detail
+    )
+    assert "at line 1" not in result.detail
+
+
+def test_a_library_the_cluster_does_not_list_is_not_ready() -> None:
+    client = library_policy_stub(
+        [cluster()], {"0101-abc": statuses((LIBRARIES[0], "INSTALLED"))}
+    )
+
+    result = check(client, EXPECTED)
+
+    assert result.presence is Presence.NOT_READY
+    assert "not listed" in result.detail
+
+
+def test_a_cluster_still_starting_is_not_ready_and_not_read() -> None:
+    client = library_policy_stub([cluster(state="PENDING")], {})
+
+    result = check(client, EXPECTED)
+
+    assert result.presence is Presence.NOT_READY
+    assert "is PENDING" in result.detail
+    assert not any(path == STATUS_PATH for path, _ in client.calls)
+
+
+def test_no_live_cluster_carrying_the_policy_is_not_ready_and_says_why() -> None:
+    # A terminated cluster and a cluster on another policy both count for
+    # nothing. The detail names the unmeasured policy_id question, because if
+    # clusters/list does not report it, every workspace reads this way.
+    client = library_policy_stub(
+        [cluster(state="TERMINATED"), cluster("0202-def", policy_id="OTHER")], {}
+    )
+
+    result = check(client, EXPECTED)
+
+    assert result.presence is Presence.NOT_READY
+    assert "session is live" in result.detail
+
+
+def test_every_page_of_clusters_is_read() -> None:
+    client = PagedStub(
+        {
+            POLICIES_PATH: {"policies": [policy()]},
+            CLUSTERS_PATH: PerQuery(
+                {
+                    frozenset(): {"clusters": [], "next_page_token": "tok2"},
+                    frozenset({("page_token", "tok2")}): {"clusters": [cluster()]},
+                }
+            ),
+            STATUS_PATH: PerQuery(
+                {
+                    frozenset({("cluster_id", "0101-abc")}): statuses(
+                        *((lib, "INSTALLED") for lib in LIBRARIES)
+                    )
+                }
+            ),
+        }
+    )
+
+    assert check(client, EXPECTED).presence is Presence.PRESENT
+
+
+def test_a_page_token_handed_back_twice_is_not_checked() -> None:
+    page = {"clusters": [], "next_page_token": "tok2"}
+    client = PagedStub(
+        {
+            POLICIES_PATH: {"policies": [policy()]},
+            CLUSTERS_PATH: PerQuery(
+                {frozenset(): page, frozenset({("page_token", "tok2")}): page}
+            ),
+        }
+    )
+
+    assert check(client, EXPECTED).presence is Presence.NOT_CHECKED
+
+
+def test_a_status_read_that_fails_is_not_checked_rather_than_not_ready() -> None:
+    client = library_policy_stub([cluster()], {"0101-abc": denied()})
+
+    assert check(client, EXPECTED).presence is Presence.NOT_CHECKED
+
+
+def test_a_policy_listing_that_fails_is_not_checked() -> None:
+    client = PagedStub({POLICIES_PATH: denied()})
+
+    assert check(client, EXPECTED).presence is Presence.NOT_CHECKED

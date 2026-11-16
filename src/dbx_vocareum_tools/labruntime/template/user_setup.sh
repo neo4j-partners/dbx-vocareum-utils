@@ -111,8 +111,20 @@ fi
 # for voc_custom_write at the bottom to record.
 cluster_name="${voclab_cluster_name}"
 cluster_action="${voclab_cluster_action}"
+# What cluster-ensure could see of the course's libraries. library_status is
+# installed, pending or missing when the cluster was already RUNNING and was
+# read, not_checked when this run created or started it, and none when the
+# course names no libraries. The three counts are empty unless it was read,
+# because a zero there would claim a reading nobody took.
+library_policy="${voclab_library_policy:-none}"
+library_policy_action="${voclab_library_policy_action:-none}"
+library_status="${voclab_library_status:-unset}"
+libraries_named="${voclab_libraries_named:-0}"
+libraries_installed="${voclab_libraries_installed:-}"
+libraries_pending="${voclab_libraries_pending:-}"
+libraries_missing="${voclab_libraries_missing:-}"
 voc_log "cluster $cluster_name: $cluster_action, ${voclab_cluster_state}"
-voc_log "libraries requested this run: ${voclab_libraries_requested}"
+voc_log "libraries the course names: $libraries_named, status: $library_status"
 
 # The course's notebooks, which no other part of Vocareum will deliver. They were
 # expected to arrive through /voc/startercode; measured in Student View,
@@ -155,7 +167,7 @@ fi
 # get at it. lab_end.sh receives this as VOC_CUSTOM_DATA, and the session record
 # carries it out to `dbx-vocareum-diagnose`.
 voc_custom_write "$(
-    printf '%s, %s, %s, %s, %s, %s, %s, %s, %s, %s' \
+    printf '%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s' \
         "$(voc_custom_field ran_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')")" \
         "$(voc_custom_field script "$VOC_SCRIPT_NAME")" \
         "$(voc_custom_field workspace_id "${workspace_id:-unknown}")" \
@@ -164,6 +176,13 @@ voc_custom_write "$(
         "$(voc_custom_field credentials_found "${credential:-none}")" \
         "$(voc_custom_field cluster_name "$cluster_name")" \
         "$(voc_custom_field cluster_action "$cluster_action")" \
+        "$(voc_custom_field library_policy "$library_policy")" \
+        "$(voc_custom_field library_policy_action "$library_policy_action")" \
+        "$(voc_custom_field library_status "$library_status")" \
+        "$(voc_custom_field libraries_named "$libraries_named")" \
+        "$(voc_custom_field libraries_installed "$libraries_installed")" \
+        "$(voc_custom_field libraries_pending "$libraries_pending")" \
+        "$(voc_custom_field libraries_missing "$libraries_missing")" \
         "$(voc_custom_field notebook_path "$notebook_path")" \
         "$(voc_custom_field notebook_action "$notebook_action")"
 )"

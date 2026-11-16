@@ -193,8 +193,10 @@ def ensure(workspace_client, **overrides) -> dict:
         "autotermination_minutes": voclab.DEFAULT_AUTOTERMINATION_MINUTES,
         # Passed rather than left to default, because the default reads the
         # environment and a test that depended on VOC_COURSE_LIBRARIES would
-        # pass or fail according to the shell it was run from.
-        "libraries": LIBRARIES,
+        # pass or fail according to the shell it was run from. Empty, so a test
+        # about the cluster is not also a test about the library policy; the
+        # policy tests below pass LIBRARIES themselves.
+        "libraries": [],
     }
     arguments.update(overrides)
     return voclab.cluster_ensure(workspace_client, **arguments)
@@ -247,12 +249,12 @@ def test_absent_cluster_is_created_with_the_workshop_configuration():
     assert body["single_user_name"] == USER
     assert body["custom_tags"]["ResourceClass"] == "SingleNode"
     assert body["spark_conf"]["spark.databricks.cluster.profile"] == "singleNode"
-    # The libraries are installed separately rather than declared on the create
+    # The libraries travel on the cluster policy rather than on the create
     # call, which is the shape the API requires.
     assert "libraries" not in body
 
 
-def test_creation_installs_every_workshop_library_and_grants_restart():
+def test_creation_grants_the_student_restart():
     client, http = workspace(
         {
             "/api/2.0/clusters/list": listing(),
@@ -260,12 +262,7 @@ def test_creation_installs_every_workshop_library_and_grants_restart():
         }
     )
 
-    fields = ensure(client)
-
-    assert fields["libraries_requested"] == str(len(LIBRARIES))
-    installed = http.body_for("/api/2.0/libraries/install")
-    assert installed["cluster_id"] == "0101-abc"
-    assert len(installed["libraries"]) == len(LIBRARIES)
+    ensure(client)
 
     acl = http.body_for("/api/2.0/permissions/clusters/0101-abc")
     assert acl["access_control_list"] == [
@@ -727,47 +724,580 @@ def test_a_cluster_belonging_to_someone_else_is_not_mistaken_for_this_one():
     assert http.body_for("/api/2.0/clusters/create")["cluster_name"] == CLUSTER
 
 
-def test_the_second_call_asks_for_no_libraries_it_already_has():
-    statuses = [{"library": library, "status": "INSTALLED"} for library in LIBRARIES]
+# --- the library policy ------------------------------------------------------
+#
+# Measured: libraries/install against a SINGLE_USER cluster is refused for the
+# service principal by the single-user check, for any library. A cluster policy
+# carrying the libraries had Databricks install them itself. So the libraries
+# travel on one shared policy found by name, and these tests pin that it is
+# created once, reused when it already says the right thing, edited when it
+# does not, and attached to every cluster this program creates.
+
+POLICIES_PATH = "/api/2.0/policies/clusters/list"
+POLICY_CREATE_PATH = "/api/2.0/policies/clusters/create"
+POLICY_EDIT_PATH = "/api/2.0/policies/clusters/edit"
+POLICY_ID = "ABC123POLICY"
+
+
+def policies(*entries) -> dict:
+    return {"policies": list(entries)}
+
+
+def library_policy(libraries=None, policy_id: str = POLICY_ID) -> dict:
+    return {
+        "name": voclab.LIBRARY_POLICY_NAME,
+        "policy_id": policy_id,
+        "definition": "{}",
+        "libraries": list(LIBRARIES if libraries is None else libraries),
+    }
+
+
+def existing_cluster(policy_id: str | None = None, state: str = "RUNNING") -> dict:
+    cluster = {"cluster_name": CLUSTER, "cluster_id": "0101-abc", "state": state}
+    if policy_id:
+        cluster["policy_id"] = policy_id
+    return cluster
+
+
+def test_an_absent_policy_is_created_and_attached_to_the_new_cluster():
+    client, http = workspace(
+        {
+            "/api/2.0/clusters/list": listing(),
+            POLICIES_PATH: policies(),
+            POLICY_CREATE_PATH: {"policy_id": POLICY_ID},
+            "/api/2.0/clusters/create": {"cluster_id": "0101-abc"},
+        }
+    )
+
+    fields = ensure(client, libraries=LIBRARIES)
+
+    assert http.body_for(POLICY_CREATE_PATH) == {
+        "name": voclab.LIBRARY_POLICY_NAME,
+        "definition": "{}",
+        "libraries": LIBRARIES,
+    }
+    assert http.body_for("/api/2.0/clusters/create")["policy_id"] == POLICY_ID
+    assert fields["library_policy"] == POLICY_ID
+    assert fields["library_policy_action"] == "created"
+    assert fields["libraries_named"] == str(len(LIBRARIES))
+    # Created this run, so nothing has installed and nothing is read.
+    assert fields["library_status"] == "not_checked"
+    assert not any("/libraries/cluster-status" in path for path in http.paths())
+    # The refused call is gone, not merely skipped on this path.
+    assert "/api/2.0/libraries/install" not in http.paths()
+
+
+def test_a_policy_that_already_carries_the_libraries_is_reused_untouched():
+    # Reversed, because the order a listing returns has not been measured and a
+    # shared policy edited on every start over an ordering quirk is a write per
+    # student that changes nothing.
+    client, http = workspace(
+        {
+            "/api/2.0/clusters/list": listing(),
+            POLICIES_PATH: policies(library_policy(list(reversed(LIBRARIES)))),
+            "/api/2.0/clusters/create": {"cluster_id": "0101-abc"},
+        }
+    )
+
+    fields = ensure(client, libraries=LIBRARIES)
+
+    assert fields["library_policy_action"] == "kept"
+    assert POLICY_CREATE_PATH not in http.paths()
+    assert POLICY_EDIT_PATH not in http.paths()
+    assert http.body_for("/api/2.0/clusters/create")["policy_id"] == POLICY_ID
+
+
+def test_a_policy_carrying_a_different_list_is_edited_to_the_course_list():
+    # A course that changed VOC_COURSE_LIBRARIES between classes must not be
+    # served last class's list by a policy found by name.
+    client, http = workspace(
+        {
+            "/api/2.0/clusters/list": listing(),
+            # Before the edit, then the read-back after it.
+            POLICIES_PATH: [
+                policies(library_policy(LIBRARIES[:1])),
+                policies(library_policy()),
+            ],
+            "/api/2.0/clusters/create": {"cluster_id": "0101-abc"},
+        }
+    )
+
+    fields = ensure(client, libraries=LIBRARIES)
+
+    assert http.body_for(POLICY_EDIT_PATH) == {
+        "policy_id": POLICY_ID,
+        "name": voclab.LIBRARY_POLICY_NAME,
+        "definition": "{}",
+        "libraries": LIBRARIES,
+    }
+    assert fields["library_policy_action"] == "updated"
+    assert POLICY_CREATE_PATH not in http.paths()
+
+
+def test_a_policy_with_another_name_is_not_the_library_policy():
+    client, http = workspace(
+        {
+            "/api/2.0/clusters/list": listing(),
+            POLICIES_PATH: policies(
+                {"name": "Personal Compute", "policy_id": "PC", "libraries": []}
+            ),
+            POLICY_CREATE_PATH: {"policy_id": POLICY_ID},
+            "/api/2.0/clusters/create": {"cluster_id": "0101-abc"},
+        }
+    )
+
+    ensure(client, libraries=LIBRARIES)
+
+    assert POLICY_CREATE_PATH in http.paths()
+    assert http.body_for("/api/2.0/clusters/create")["policy_id"] == POLICY_ID
+
+
+def test_a_course_with_no_libraries_makes_no_policy_call():
+    client, http = workspace(
+        {
+            "/api/2.0/clusters/list": listing(),
+            "/api/2.0/clusters/create": {"cluster_id": "0101-abc"},
+        }
+    )
+
+    fields = ensure(client, libraries=[])
+
+    assert not any("/policies/" in path for path in http.paths())
+    assert "policy_id" not in http.body_for("/api/2.0/clusters/create")
+    assert fields["library_policy"] == "none"
+    assert fields["libraries_named"] == "0"
+    assert fields["library_status"] == "none"
+
+
+@pytest.mark.parametrize("pooled", [True, False])
+def test_both_create_bodies_carry_the_policy(pooled):
+    client, http = workspace(
+        {
+            "/api/2.0/clusters/list": listing(),
+            POOLS_PATH: pools(pool()) if pooled else pools(),
+            SPARK_VERSIONS_PATH: spark_versions(voclab.DEFAULT_SPARK_VERSION),
+            POLICIES_PATH: policies(library_policy()),
+            "/api/2.0/clusters/create": {"cluster_id": "0101-abc"},
+        }
+    )
+
+    ensure(client, libraries=LIBRARIES)
+
+    body = http.body_for("/api/2.0/clusters/create")
+    assert body["policy_id"] == POLICY_ID
+    assert ("instance_pool_id" in body) is pooled
+    assert ("node_type_id" in body) is not pooled
+
+
+GET_PATH = "/api/2.0/clusters/get?cluster_id=0101-abc"
+STATUS_PATH = "/api/2.0/libraries/cluster-status?cluster_id=0101-abc"
+
+
+def library_statuses(*pairs) -> dict:
+    """A cluster-status payload from (library, status) pairs."""
+    return {
+        "cluster_id": "0101-abc",
+        "library_statuses": [
+            {"library": library, "status": status, "is_library_for_all_clusters": False}
+            for library, status in pairs
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "carried", [None, "SOMEOTHERPOLICY"], ids=["no policy", "another policy"]
+)
+def test_an_existing_cluster_without_the_policy_fails_before_it_is_started(carried):
+    # Attaching a policy is a clusters/edit, and an edit restarts the student's
+    # cluster under them, so it is not attached. A hook exiting 0 on a cluster
+    # without the course's libraries is a lab that fails at its first import,
+    # so it is not let through either. Terminated, so the test also pins that
+    # the failure comes before the start that would bill for it.
     client, http = workspace(
         {
             "/api/2.0/clusters/list": listing(
-                {
-                    "cluster_name": CLUSTER,
-                    "cluster_id": "0101-abc",
-                    "state": "RUNNING",
-                }
+                existing_cluster(carried, state="TERMINATED")
             ),
-            "/api/2.0/libraries/cluster-status?cluster_id=0101-abc": {
-                "library_statuses": statuses
+            POLICIES_PATH: policies(library_policy()),
+            GET_PATH: {"cluster_id": "0101-abc"},
+        }
+    )
+
+    with pytest.raises(voclab.VoclabError) as failure:
+        ensure(client, libraries=LIBRARIES)
+
+    assert failure.value.code == "LIBRARY_POLICY_ABSENT"
+    assert POLICY_ID in failure.value.message
+    # The remedy is in the message, because the person reading it is an
+    # operator with a voccustomdata.txt and no repository open.
+    assert f"delete the student's cluster {CLUSTER} and restart the lab" in (
+        failure.value.message
+    )
+    assert failure.value.fields["cluster_id"] == "0101-abc"
+    assert "/api/2.0/clusters/edit" not in http.paths()
+    assert "/api/2.0/clusters/start" not in http.paths()
+
+
+def test_a_listing_without_policy_id_is_checked_against_clusters_get():
+    # Measured 2026-11-16, clusters/list reports policy_id. The fallback stays,
+    # because a listing that ever omitted it would otherwise fail every student
+    # whose cluster is fine.
+    client, http = workspace(
+        {
+            "/api/2.0/clusters/list": listing(existing_cluster()),
+            POLICIES_PATH: policies(library_policy()),
+            GET_PATH: {"cluster_id": "0101-abc", "policy_id": POLICY_ID},
+            STATUS_PATH: library_statuses(*((lib, "INSTALLED") for lib in LIBRARIES)),
+        }
+    )
+
+    fields = ensure(client, libraries=LIBRARIES)
+
+    assert GET_PATH in http.paths()
+    assert fields["library_policy"] == POLICY_ID
+
+
+def test_a_listing_that_carries_policy_id_is_not_read_again():
+    client, http = workspace(
+        {
+            "/api/2.0/clusters/list": listing(existing_cluster(POLICY_ID)),
+            POLICIES_PATH: policies(library_policy()),
+        }
+    )
+
+    ensure(client, libraries=LIBRARIES)
+
+    assert GET_PATH not in http.paths()
+
+
+def test_a_clusters_get_that_fails_is_its_own_failure():
+    client, _ = workspace(
+        {
+            "/api/2.0/clusters/list": listing(existing_cluster()),
+            POLICIES_PATH: policies(library_policy()),
+            GET_PATH: http_error(403, {"error_code": "PERMISSION_DENIED"}),
+        }
+    )
+
+    with pytest.raises(voclab.VoclabError) as failure:
+        ensure(client, libraries=LIBRARIES)
+
+    assert failure.value.code == "CLUSTER_GET_FAILED"
+
+
+def test_an_existing_cluster_carrying_the_policy_records_its_id():
+    client, http = workspace(
+        {
+            "/api/2.0/clusters/list": listing(existing_cluster(POLICY_ID)),
+            POLICIES_PATH: policies(library_policy()),
+        }
+    )
+
+    fields = ensure(client, libraries=LIBRARIES)
+
+    assert fields["library_policy"] == POLICY_ID
+    assert fields["library_policy_action"] == "kept"
+    assert "/api/2.0/clusters/edit" not in http.paths()
+
+
+def test_a_running_cluster_with_every_library_installed_says_so():
+    client, http = workspace(
+        {
+            "/api/2.0/clusters/list": listing(existing_cluster(POLICY_ID)),
+            POLICIES_PATH: policies(library_policy()),
+            STATUS_PATH: library_statuses(*((lib, "INSTALLED") for lib in LIBRARIES)),
+        }
+    )
+
+    fields = ensure(client, libraries=LIBRARIES)
+
+    assert fields["library_status"] == "installed"
+    assert fields["libraries_installed"] == "2"
+    assert fields["libraries_pending"] == "0"
+    assert fields["libraries_missing"] == "0"
+    # After the grant, so a student whose libraries failed can still restart.
+    assert http.paths().index(STATUS_PATH) > http.paths().index(
+        "/api/2.0/permissions/clusters/0101-abc"
+    )
+
+
+def test_a_library_still_installing_is_pending_not_a_failure():
+    client, _ = workspace(
+        {
+            "/api/2.0/clusters/list": listing(existing_cluster(POLICY_ID)),
+            POLICIES_PATH: policies(library_policy()),
+            STATUS_PATH: library_statuses(
+                (LIBRARIES[0], "INSTALLED"), (LIBRARIES[1], "PENDING")
+            ),
+        }
+    )
+
+    fields = ensure(client, libraries=LIBRARIES)
+
+    assert fields["library_status"] == "pending"
+    assert fields["libraries_installed"] == "1"
+    assert fields["libraries_pending"] == "1"
+
+
+def test_a_library_the_cluster_never_lists_is_counted_as_missing():
+    # Whether a policy edited after the cluster started reaches it is open.
+    # This count is where that would show, so it is kept apart from pending.
+    client, _ = workspace(
+        {
+            "/api/2.0/clusters/list": listing(existing_cluster(POLICY_ID)),
+            POLICIES_PATH: policies(library_policy()),
+            STATUS_PATH: library_statuses((LIBRARIES[0], "INSTALLED")),
+        }
+    )
+
+    fields = ensure(client, libraries=LIBRARIES)
+
+    assert fields["library_status"] == "missing"
+    assert fields["libraries_missing"] == "1"
+
+
+@pytest.mark.parametrize("status", ["FAILED", "SKIPPED"])
+def test_a_library_that_will_not_install_fails_the_run_by_name(status):
+    client, http = workspace(
+        {
+            "/api/2.0/clusters/list": listing(existing_cluster(POLICY_ID)),
+            POLICIES_PATH: policies(library_policy()),
+            STATUS_PATH: {
+                "library_statuses": [
+                    {"library": LIBRARIES[0], "status": "INSTALLED"},
+                    {
+                        "library": LIBRARIES[1],
+                        "status": status,
+                        "messages": ["Library resolution failed.\nstack trace"],
+                    },
+                ]
             },
         }
     )
 
-    fields = ensure(client)
+    with pytest.raises(voclab.VoclabError) as failure:
+        ensure(client, libraries=LIBRARIES)
 
-    assert fields["libraries_requested"] == "0"
-    assert "/api/2.0/libraries/install" not in http.paths()
-
-
-# --- library reconciliation --------------------------------------------------
-
-
-def test_a_failed_library_is_asked_for_again():
-    wanted = [{"pypi": {"package": "neo4j==6.2.0"}}]
-    statuses = [{"library": wanted[0], "status": "FAILED"}]
-    assert voclab.missing_libraries(statuses, wanted) == wanted
+    assert failure.value.code == "LIBRARY_INSTALL_FAILED"
+    assert "maven:org.neo4j:neo4j-connector-apache-spark_2.13" in failure.value.message
+    assert "Library resolution failed." in failure.value.message
+    assert "stack trace" not in failure.value.message
+    assert failure.value.fields["library_status"] == "failed"
+    # The grant still went through before the read.
+    assert "/api/2.0/permissions/clusters/0101-abc" in http.paths()
 
 
-def test_a_pending_library_is_left_to_arrive():
-    wanted = [{"pypi": {"package": "neo4j==6.2.0"}}]
-    statuses = [{"library": wanted[0], "status": "PENDING"}]
-    assert voclab.missing_libraries(statuses, wanted) == []
+def test_a_status_read_that_fails_is_reported_not_skipped():
+    client, _ = workspace(
+        {
+            "/api/2.0/clusters/list": listing(existing_cluster(POLICY_ID)),
+            POLICIES_PATH: policies(library_policy()),
+            STATUS_PATH: http_error(403, {"error_code": "PERMISSION_DENIED"}),
+        }
+    )
+
+    with pytest.raises(voclab.VoclabError) as failure:
+        ensure(client, libraries=LIBRARIES)
+
+    assert failure.value.code == "LIBRARY_STATUS_FAILED"
+    assert failure.value.fields["cluster_id"] == "0101-abc"
 
 
-def test_an_absent_status_list_means_nothing_is_installed():
-    wanted = list(LIBRARIES)
-    assert voclab.missing_libraries(None, wanted) == wanted
+@pytest.mark.parametrize("state", ["TERMINATED", "PENDING"])
+def test_a_cluster_not_already_running_is_not_read(state):
+    # Nothing here waits on a cluster. Read now, it could only say PENDING.
+    client, http = workspace(
+        {
+            "/api/2.0/clusters/list": listing(existing_cluster(POLICY_ID, state)),
+            POLICIES_PATH: policies(library_policy()),
+        }
+    )
+
+    fields = ensure(client, libraries=LIBRARIES)
+
+    assert fields["library_status"] == "not_checked"
+    assert STATUS_PATH not in http.paths()
+
+
+def test_an_edit_the_read_back_does_not_confirm_fails_by_difference():
+    # If the listing hands libraries back in a shape other than the one sent,
+    # every student would edit the shared policy again. One failure, naming
+    # the difference, beats a silent write per student.
+    client, _ = workspace(
+        {
+            "/api/2.0/clusters/list": listing(),
+            POLICIES_PATH: [
+                policies(library_policy(LIBRARIES[:1])),
+                policies(library_policy(LIBRARIES[:1])),
+            ],
+        }
+    )
+
+    with pytest.raises(voclab.VoclabError) as failure:
+        ensure(client, libraries=LIBRARIES)
+
+    assert failure.value.code == "LIBRARY_POLICY_FAILED"
+    assert "missing from the policy: maven:" in failure.value.message
+    assert "not in the course: none" in failure.value.message
+
+
+def test_an_edit_sends_back_the_definition_it_listed():
+    # An edit replaces the definition. Sending "{}" would wipe a limit somebody
+    # added to the shared policy by hand.
+    definition = '{"autotermination_minutes": {"type": "fixed", "value": 60}}'
+    before = library_policy(LIBRARIES[:1])
+    before["definition"] = definition
+    after = library_policy()
+    after["definition"] = definition
+    client, http = workspace(
+        {
+            "/api/2.0/clusters/list": listing(),
+            POLICIES_PATH: [policies(before), policies(after)],
+            "/api/2.0/clusters/create": {"cluster_id": "0101-abc"},
+        }
+    )
+
+    ensure(client, libraries=LIBRARIES)
+
+    assert http.body_for(POLICY_EDIT_PATH)["definition"] == definition
+
+
+def test_an_edit_carries_every_listed_field_it_does_not_change():
+    # An edit replaces the whole policy. A field left out of the body is a field
+    # the edit clears, so a hand-set description or per-user cap must survive.
+    before = library_policy(LIBRARIES[:1])
+    before["description"] = "set by hand"
+    before["max_clusters_per_user"] = 2
+    client, http = workspace(
+        {
+            "/api/2.0/clusters/list": listing(),
+            POLICIES_PATH: [policies(before), policies(library_policy())],
+            "/api/2.0/clusters/create": {"cluster_id": "0101-abc"},
+        }
+    )
+
+    ensure(client, libraries=LIBRARIES)
+
+    body = http.body_for(POLICY_EDIT_PATH)
+    assert body["description"] == "set by hand"
+    assert body["max_clusters_per_user"] == 2
+    assert body["libraries"] == LIBRARIES
+    assert "policy_family_id" not in body
+
+
+def test_an_edit_of_a_family_policy_sends_the_family_not_the_definition():
+    # A family policy's listed definition is the family's merged with the
+    # overrides. The family and the overrides are what define it.
+    before = library_policy(LIBRARIES[:1])
+    before["policy_family_id"] = "personal-vm"
+    before["policy_family_definition_overrides"] = "{}"
+    before["definition"] = '{"merged": {"type": "fixed", "value": 1}}'
+    client, http = workspace(
+        {
+            "/api/2.0/clusters/list": listing(),
+            POLICIES_PATH: [policies(before), policies(library_policy())],
+            "/api/2.0/clusters/create": {"cluster_id": "0101-abc"},
+        }
+    )
+
+    ensure(client, libraries=LIBRARIES)
+
+    body = http.body_for(POLICY_EDIT_PATH)
+    assert body["policy_family_id"] == "personal-vm"
+    assert body["policy_family_definition_overrides"] == "{}"
+    assert "definition" not in body
+
+
+def test_a_policy_listing_that_fails_stops_before_any_cluster_is_created():
+    client, http = workspace(
+        {
+            "/api/2.0/clusters/list": listing(),
+            POLICIES_PATH: http_error(403, {"error_code": "PERMISSION_DENIED"}),
+            "/api/2.0/clusters/create": {"cluster_id": "0101-abc"},
+        }
+    )
+
+    with pytest.raises(voclab.VoclabError) as failure:
+        ensure(client, libraries=LIBRARIES)
+
+    assert failure.value.code == "LIBRARY_POLICY_FAILED"
+    assert "PERMISSION_DENIED" in failure.value.message
+    assert failure.value.fields["cluster_name"] == CLUSTER
+    assert "/api/2.0/clusters/create" not in http.paths()
+
+
+def test_a_policy_edit_that_fails_still_reports_the_existing_cluster():
+    client, _ = workspace(
+        {
+            "/api/2.0/clusters/list": listing(existing_cluster(POLICY_ID)),
+            POLICIES_PATH: policies(library_policy(LIBRARIES[:1])),
+            POLICY_EDIT_PATH: http_error(
+                400, {"error_code": "INVALID_PARAMETER_VALUE", "message": "no"}
+            ),
+        }
+    )
+
+    with pytest.raises(voclab.VoclabError) as failure:
+        ensure(client, libraries=LIBRARIES)
+
+    assert failure.value.code == "LIBRARY_POLICY_FAILED"
+    assert failure.value.fields["cluster_id"] == "0101-abc"
+
+
+def test_a_policy_create_that_returns_no_id_is_a_failure():
+    client, http = workspace(
+        {
+            "/api/2.0/clusters/list": listing(),
+            POLICIES_PATH: policies(),
+            POLICY_CREATE_PATH: {},
+        }
+    )
+
+    with pytest.raises(voclab.VoclabError) as failure:
+        ensure(client, libraries=LIBRARIES)
+
+    assert failure.value.code == "LIBRARY_POLICY_FAILED"
+    assert "/api/2.0/clusters/create" not in http.paths()
+
+
+def test_a_policy_create_lost_to_another_hook_uses_the_winner():
+    # Every student on a fresh workspace races to create the one shared policy,
+    # and names are unique, so all but one create fails. The loser looks again
+    # rather than failing a student's lab over a policy that now exists.
+    client, http = workspace(
+        {
+            "/api/2.0/clusters/list": listing(),
+            POLICIES_PATH: [policies(), policies(library_policy())],
+            POLICY_CREATE_PATH: http_error(
+                400, {"error_code": "INVALID_PARAMETER_VALUE", "message": "exists"}
+            ),
+            "/api/2.0/clusters/create": {"cluster_id": "0101-abc"},
+        }
+    )
+
+    fields = ensure(client, libraries=LIBRARIES)
+
+    assert fields["library_policy_action"] == "kept"
+    assert http.body_for("/api/2.0/clusters/create")["policy_id"] == POLICY_ID
+
+
+def test_a_policy_create_that_fails_with_no_winner_is_reported():
+    client, http = workspace(
+        {
+            "/api/2.0/clusters/list": listing(),
+            POLICIES_PATH: [policies(), policies()],
+            POLICY_CREATE_PATH: http_error(
+                403, {"error_code": "PERMISSION_DENIED", "message": "no"}
+            ),
+        }
+    )
+
+    with pytest.raises(voclab.VoclabError) as failure:
+        ensure(client, libraries=LIBRARIES)
+
+    assert failure.value.code == "LIBRARY_POLICY_FAILED"
+    assert "PERMISSION_DENIED" in failure.value.message
+    assert "/api/2.0/clusters/create" not in http.paths()
 
 
 # --- resource tags, whose format is not documented ---------------------------
@@ -881,6 +1411,53 @@ def test_reclaiming_a_cluster_that_is_already_gone_is_not_a_failure():
 
     assert fields["cluster_action"] == "absent"
     assert http.paths("POST") == []
+
+
+# --- reading every page of clusters/list -------------------------------------
+#
+# A cluster on page two read as absent would get a second cluster created under
+# the same name. Whether the 2.0 path pages is unmeasured, so the token is
+# followed whenever one comes back.
+
+PAGE_TWO_PATH = "/api/2.0/clusters/list?page_token=tok2"
+
+
+def test_a_cluster_on_the_second_page_is_found():
+    first = listing({"cluster_name": "someone_else", "cluster_id": "0101-zzz"})
+    first["next_page_token"] = "tok2"
+    client, http = workspace(
+        {
+            "/api/2.0/clusters/list": first,
+            PAGE_TWO_PATH: listing(existing_cluster()),
+        }
+    )
+
+    fields = ensure(client)
+
+    assert fields["cluster_action"] == "running"
+    assert "/api/2.0/clusters/create" not in http.paths()
+    assert http.paths("GET")[:2] == ["/api/2.0/clusters/list", PAGE_TWO_PATH]
+
+
+def test_a_listing_with_no_token_is_one_request():
+    client, http = workspace({"/api/2.0/clusters/list": listing(existing_cluster())})
+
+    voclab.cluster_release(client, USER, permanent=True)
+
+    assert http.paths("GET").count("/api/2.0/clusters/list") == 1
+    assert not any("page_token" in path for path in http.paths())
+
+
+def test_a_page_token_handed_back_twice_is_a_failure_not_a_loop():
+    page = listing()
+    page["next_page_token"] = "tok2"
+    client, _ = workspace({"/api/2.0/clusters/list": page, PAGE_TWO_PATH: dict(page)})
+
+    with pytest.raises(voclab.VoclabError) as failure:
+        voclab.cluster_release(client, USER, permanent=True)
+
+    assert failure.value.code == "CLUSTER_LIST_FAILED"
+    assert "next_page_token" in failure.value.message
 
 
 # --- handing the student the notebook ----------------------------------------
@@ -1541,10 +2118,22 @@ def test_a_maven_coordinate_keeps_the_colons_that_are_part_of_it():
     ]
 
 
+def test_a_requirements_file_is_one_string_field():
+    # Measured, the policy takes a requirements library as one string and lists
+    # it back exactly as sent. It is how a lock file pinning every dependency is
+    # installed, since pinning only the top level does not stop pip backtracking.
+    path = "/Workspace/Shared/course/requirements.lock.txt"
+
+    libraries = voclab.parse_libraries(f"requirements:{path}, pypi:neo4j")
+
+    assert libraries == [{"requirements": path}, {"pypi": {"package": "neo4j"}}]
+    assert voclab.library_label(libraries[0]) == f"requirements:{path}"
+
+
 def test_a_library_kind_nobody_recognizes_fails_rather_than_being_skipped():
     # A dropped library is a cluster that comes up fine and a notebook that
     # fails at its first import, which is the most expensive place to find out.
-    for bad in ("conda:numpy", "neo4j==6.2.0", "pypi:"):
+    for bad in ("conda:numpy", "neo4j==6.2.0", "pypi:", "requirements:"):
         with pytest.raises(voclab.VoclabError) as failure:
             voclab.parse_libraries(bad)
         assert failure.value.code == "BAD_COURSE_VALUE"
@@ -1847,3 +2436,180 @@ def test_the_starter_warehouse_needs_no_student_to_exist(monkeypatch):
     fields = voclab.run(voclab.build_parser().parse_args(["starter-warehouse"]))
 
     assert fields["starter_warehouse_action"] == "resized"
+
+
+# --- token-probe, a diagnostic rather than a lifecycle step -------------------
+#
+# It answers whose identity VOC_DB_API_TOKEN carries and what it may do.
+# Every test below is about it staying readable when the answer is "no", because
+# workspace_init.sh runs under set -e and a probe that raised would take a class
+# down over an optional question.
+
+TOKEN_PROBE_PATHS = [path for _, path in voclab.TOKEN_PROBE_OPERATIONS]
+
+
+def token_probe_answers(**overrides) -> dict:
+    """Every probe path allowed, with the ones overridden replaced."""
+    answers = {
+        "/api/2.0/preview/scim/v2/Me": {"userName": "sp-example", "id": "9911"},
+        "/api/2.0/clusters/list": listing({"cluster_name": "x"}),
+        "/api/2.0/instance-pools/list": pools(pool()),
+        "/api/2.0/sql/warehouses": {"warehouses": [{"id": "w1"}]},
+        "/api/2.1/unity-catalog/catalogs": {"catalogs": [{"name": "main"}]},
+        "/api/2.0/workspace/list?path=%2F": {"objects": [{"path": "/Shared"}]},
+        "/api/2.0/preview/scim/v2/Groups?count=1": {"Resources": [{"id": "1"}]},
+        "/api/2.0/token/list": {"token_infos": [{"token_id": "t1"}]},
+    }
+    answers.update(overrides)
+    return answers
+
+
+def test_token_probe_asks_only_read_only_calls():
+    # It runs inside workspace_init.sh, so anything it created would bill on
+    # every Rerun Init forever.
+    client, http = workspace(token_probe_answers())
+
+    voclab.token_probe(client, "VOC_DB_API_TOKEN")
+
+    assert http.paths() == TOKEN_PROBE_PATHS
+    assert http.paths("POST") == []
+    assert all(body is None for _, _, body in http.calls)
+
+
+def test_token_probe_reports_the_identity_the_credential_carries():
+    client, _ = workspace(token_probe_answers())
+
+    fields = voclab.token_probe(client, "VOC_DB_API_TOKEN")
+
+    assert fields["token_probe_identity"] == "ALLOWED"
+    assert fields["token_probe_identity_name"] == "sp-example"
+    assert fields["token_probe_identity_id"] == "9911"
+
+
+def test_token_probe_records_a_refusal_rather_than_raising():
+    # The whole design decision, in one test. A denied call is the answer.
+    client, _ = workspace(
+        token_probe_answers(
+            **{
+                "/api/2.0/token/list": http_error(
+                    403, {"error_code": "PERMISSION_DENIED"}
+                )
+            }
+        )
+    )
+
+    fields = voclab.token_probe(client, "VOC_DB_API_TOKEN")
+
+    assert fields["token_probe_tokens_list"] == "PERMISSION_DENIED"
+    # And the calls after it still ran, so one refusal does not end the reading.
+    assert fields["token_probe_catalogs_list"] == "ALLOWED"
+
+
+def test_token_probe_keeps_a_404_separate_from_a_denial():
+    # Databricks reports "you may not see this" as "this does not exist", so
+    # calling a 404 a refusal would be a measurement this file did not make.
+    client, _ = workspace(
+        token_probe_answers(**{"/api/2.0/clusters/list": http_error(404)})
+    )
+
+    fields = voclab.token_probe(client, "VOC_DB_API_TOKEN")
+
+    assert fields["token_probe_clusters_list"] == "NOT_FOUND_OR_HIDDEN"
+
+
+def test_token_probe_names_unity_catalog_refusals_separately():
+    client, _ = workspace(
+        token_probe_answers(
+            **{
+                "/api/2.1/unity-catalog/catalogs": http_error(
+                    403, {"error_code": "UNITY_CATALOG_PERMISSION_DENIED"}
+                )
+            }
+        )
+    )
+
+    fields = voclab.token_probe(client, "VOC_DB_API_TOKEN")
+
+    assert fields["token_probe_catalogs_list"] == "UNITY_CATALOG_DENIED"
+
+
+def test_token_probe_reports_a_bad_credential_as_unauthenticated():
+    client, _ = workspace(
+        dict.fromkeys(
+            TOKEN_PROBE_PATHS, http_error(401, {"error_code": "UNAUTHORIZED"})
+        )
+    )
+
+    fields = voclab.token_probe(client, "VOC_DB_API_TOKEN")
+
+    assert fields["token_probe_identity"] == "UNAUTHENTICATED"
+    assert fields["token_probe_identity_name"] == "unknown"
+
+
+def test_token_probe_tells_an_empty_list_from_a_populated_one():
+    # An empty list is permitted-and-empty or permitted-to-ask-and-shown-nothing.
+    # Reporting both as ALLOWED would claim more than the call earned.
+    client, _ = workspace(token_probe_answers(**{"/api/2.0/clusters/list": listing()}))
+
+    fields = voclab.token_probe(client, "VOC_DB_API_TOKEN")
+
+    assert fields["token_probe_clusters_list"] == "ALLOWED_EMPTY"
+
+
+def test_token_probe_never_prints_a_credential_value(monkeypatch):
+    secret = "dapi-this-must-not-appear"
+    monkeypatch.setenv("VOC_DB_API_TOKEN", secret)
+    monkeypatch.setenv("VOC_DB_SP_SECRET", secret)
+    monkeypatch.delenv("VOC_DB_SP_APPLICATION_ID", raising=False)
+    monkeypatch.delenv("DATABRICKS_TOKEN", raising=False)
+    client, _ = workspace(token_probe_answers())
+
+    fields = voclab.token_probe(client, "VOC_DB_API_TOKEN")
+
+    assert fields["token_probe_credentials_set"] == "VOC_DB_API_TOKEN,VOC_DB_SP_SECRET"
+    assert secret not in " ".join(str(value) for value in fields.values())
+
+
+def test_token_probe_names_which_variable_supplied_the_credential(monkeypatch):
+    # Without this the run reports a correct answer about the wrong principal:
+    # a host with no VOC_DB_API_TOKEN falls through to DATABRICKS_TOKEN.
+    monkeypatch.delenv("VOC_DB_API_TOKEN", raising=False)
+    monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-laptop")
+    args = voclab.build_parser().parse_args(["token-probe"])
+
+    assert voclab.token_probe_source(args) == "DATABRICKS_TOKEN"
+
+
+def test_token_probe_prefers_the_variable_vocareum_hands_the_hook(monkeypatch):
+    monkeypatch.setenv("VOC_DB_API_TOKEN", "dapi-hook")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-laptop")
+    args = voclab.build_parser().parse_args(["token-probe"])
+
+    assert voclab.token_probe_source(args) == "VOC_DB_API_TOKEN"
+
+
+def test_token_probe_needs_no_student_to_exist(monkeypatch):
+    # Same reason as the two warehouse commands: workspace_init.sh runs before
+    # any student exists, so asking for VOC_DB_USER_EMAIL would fail the hook
+    # over a value nothing was going to use.
+    monkeypatch.delenv("VOC_DB_USER_EMAIL", raising=False)
+    client, _ = workspace(token_probe_answers())
+    monkeypatch.setattr(voclab, "build_workspace", lambda args: client)
+
+    fields = voclab.run(voclab.build_parser().parse_args(["token-probe"]))
+
+    assert fields["token_probe_identity_name"] == "sp-example"
+
+
+def test_token_probe_emits_keys_the_shell_can_turn_into_variables(capsys):
+    # voc_voclab makes a voclab_<key> variable per line, and a key outside
+    # [a-z0-9_] is one the shell cannot name.
+    client, _ = workspace(token_probe_answers())
+
+    voclab.emit(voclab.token_probe(client, "VOC_DB_API_TOKEN"))
+
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert len(lines) == len(voclab.TOKEN_PROBE_OPERATIONS) + 4
+    for line in lines:
+        key = line.split("=", 1)[0]
+        assert voclab.VALID_OUTPUT_KEY.match(key), key

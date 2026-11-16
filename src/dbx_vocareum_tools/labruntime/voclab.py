@@ -37,9 +37,10 @@ which produces exactly the lab that failed for no stated reason that
 ``voc_fail`` exists to prevent. ``key=value`` rather than JSON so the shell side
 needs no JSON parser.
 
-Nothing here waits on a cluster. ``clusters/create`` and ``libraries/install``
-both return as soon as the request is accepted and the cluster warms
-server-side, so a hook makes a handful of short requests and exits. Pre-warming
+Nothing here waits on a cluster. ``clusters/create`` returns as soon as the
+request is accepted, the cluster warms server-side, and Databricks installs the
+libraries its cluster policy carries without a further call from here. So a
+hook makes a handful of short requests and exits. Pre-warming
 from ``lab_setup.sh`` is worth doing anyway: resolving the Neo4j Spark connector
 from Maven and installing ten pypi packages is several minutes of cluster
 time, and that is time a student should not be sitting through.
@@ -114,8 +115,9 @@ SPARK_VERSION_VAR = "VOC_COURSE_SPARK_VERSION"
 # of the built-in **Personal Compute** policy, in that order, with i3.xlarge as
 # its defaultValue. The screen was filtered by the policy the UI had selected.
 #
-# Nothing here sets policy_id, so that allowlist never applies to these clusters
-# and a wider choice is available than the screenshot suggested. i3.xlarge is
+# The only policy_id set here is LIBRARY_POLICY_NAME's, whose definition is
+# empty, so that allowlist never applies to these clusters and a wider choice is
+# available than the screenshot suggested. i3.xlarge is
 # kept anyway: it is what the Personal Compute default would give a student who
 # made their own cluster, so the provisioned cluster and a hand-made one behave
 # alike, and 4 cores with 30.5 GB is ample for labs that push the work to Aura.
@@ -194,26 +196,73 @@ SINGLE_NODE_SPARK_CONF = {
 # library list for one would put somebody else's dependency on their cluster.
 LIBRARIES_VAR = "VOC_COURSE_LIBRARIES"
 
-# How each ``kind`` becomes the library specification the API wants. Five of the
-# six documented kinds take a single string, which is what makes a one-line
-# format possible at all; ``requirements`` and the pypi ``repo`` variant are
-# left out because neither can be said in one field and neither has been needed.
+# How each ``kind`` becomes the library specification the API wants. Every
+# documented kind takes a single string, which is what makes a one-line format
+# possible at all. The pypi ``repo`` variant is left out because it is a second
+# field and nothing has needed it.
+#
+# ``requirements`` is the path of a requirements file, sent as one string field.
+# Measured 2026-11-16, ``policies/clusters/edit`` accepts
+# ``{"requirements": "<path>"}`` and the policy listing returns it exactly as
+# sent. It is here for a lock file. Measured the same day on DBR 17.3 ML,
+# pinning only the top-level packages does not stop pip backtracking:
+# ``databricks-langchain==0.22.0`` alone backtracked through its dependencies
+# for more than 6 minutes while every other library installed in seconds. A
+# file pinning the whole dependency tree gives pip nothing to search.
 LIBRARY_KINDS = {
     "pypi": lambda value: {"pypi": {"package": value}},
     "maven": lambda value: {"maven": {"coordinates": value}},
     "cran": lambda value: {"cran": {"package": value}},
     "jar": lambda value: {"jar": value},
     "whl": lambda value: {"whl": value},
+    "requirements": lambda value: {"requirements": value},
 }
+
+# The cluster policy that carries the course's libraries onto each student's
+# cluster, found by name for the same reason a cluster and a pool are.
+#
+# A policy rather than ``libraries/install``, and that is a measurement. The
+# cluster is SINGLE_USER with the lab identity as its single user, and the hook's
+# token carries the service principal. Measured 2026-11-16, ``libraries/install``
+# against such a cluster is refused for any library at all:
+#
+#     PERMISSION_DENIED: Single-user check failed: user '<sp-application-id>'
+#     attempted to run a command on single-user cluster <cluster-id>, but the
+#     single user of this cluster is '<lab identity>'.
+#
+# Measured the same day, as the same principal: a policy created with these
+# libraries and attached to that cluster had Databricks install them itself, on
+# the restart the attach caused. No call ran as the student and no single-user
+# check fired. docs/permissions.md holds the result.
+#
+# One policy per workspace, because Vocareum makes one workspace per part and
+# every student in it asks for the same libraries. It is therefore shared, and
+# lab_end.sh must never delete it: a session ending is one student leaving, and
+# deleting the policy would strip the libraries from the next student's cluster.
+LIBRARY_POLICY_NAME = "voc-course-libraries"
+
+# Empty, so the policy constrains nothing and only carries libraries. A
+# definition here would be a limit applied to every student's cluster from a
+# constant nobody reading course.env would see.
+LIBRARY_POLICY_DEFINITION = "{}"
 
 # A cluster in one of these states is on its way up or already up, so asking for
 # it to start again is at best wasted and at worst an error.
 LIVE_CLUSTER_STATES = frozenset({"RUNNING", "PENDING", "RESIZING", "RESTARTING"})
 
-# A library in one of these states will not arrive without being asked for
-# again. Every other status means it is installed or on its way, so re-requesting
-# it would be noise.
-UNSATISFIED_LIBRARY_STATUSES = frozenset({"FAILED", "UNINSTALL_ON_RESTART"})
+# Library statuses read off ``libraries/cluster-status``, sorted by what they
+# mean for the student. Measured 2026-11-16: a policy's libraries appear there
+# as PENDING and then INSTALLED, like any other library.
+#
+# FAILED and SKIPPED will not arrive without someone acting. SKIPPED is what
+# Databricks reports for a library it judged incompatible with the runtime, so
+# from the student's side it is a failure with a politer name. Every other
+# status, RESTORED and UNINSTALL_ON_RESTART included, is counted as pending
+# rather than installed. Neither has been seen on these clusters, and a status
+# counted as done that is not done is the silent success this check exists to
+# remove.
+INSTALLED_LIBRARY_STATUS = "INSTALLED"
+FAILED_LIBRARY_STATUSES = frozenset({"FAILED", "SKIPPED"})
 
 # Databricks caps a cluster name at 100 characters and accepts a narrow
 # character set. A Vocareum lab identity looks like student1_200000@vocareum.com,
@@ -424,6 +473,11 @@ class ApiError(Exception):
 
     def __init__(self, method: str, path: str, detail: str) -> None:
         super().__init__(f"{method} {path} failed: {detail}")
+        # Kept as an attribute as well as in the message because ``token-probe``
+        # classifies a refusal rather than reporting it, and reading the status
+        # back out of a formatted sentence would make that classification depend
+        # on the wording of ``api_detail``.
+        self.detail = detail
 
 
 def api_detail(status: str, body: str) -> str:
@@ -586,7 +640,7 @@ def course_int(name: str, default: int) -> int:
 
 
 def parse_libraries(raw: str) -> list:
-    """Turn the course's library list into what ``libraries/install`` wants.
+    """Turn the course's library list into a cluster policy's ``libraries``.
 
     Separators are newline and comma, so the value reads naturally in a
     ``course.env`` either way. The kind is split off at the **first** colon only,
@@ -701,6 +755,7 @@ def cluster_settings(
     catalog: str | None = None,
     tags: dict | None = None,
     instance_pool_id: str | None = None,
+    policy_id: str | None = None,
 ) -> dict:
     """Build the ``clusters/create`` body for one student's cluster.
 
@@ -728,6 +783,10 @@ def cluster_settings(
     which ``dbx-vocareum-pool --create`` creates ``ON_DEMAND`` for that reason. A
     pool made by hand with defaults is ``SPOT``, which is why the pool is created
     by a tool rather than through the console.
+
+    ``policy_id`` is the library policy, and it is set before the pool branch so
+    that both bodies carry it. The policy is how the libraries arrive at all on a
+    ``SINGLE_USER`` cluster; see ``LIBRARY_POLICY_NAME``.
     """
     custom_tags = dict(tags or {})
     if "ResourceClass" in custom_tags:
@@ -751,6 +810,8 @@ def cluster_settings(
         "custom_tags": custom_tags,
         "spark_env_vars": {"PYSPARK_PYTHON": "/databricks/python3/bin/python3"},
     }
+    if policy_id:
+        settings["policy_id"] = policy_id
 
     if instance_pool_id:
         settings["instance_pool_id"] = instance_pool_id
@@ -773,22 +834,53 @@ def library_key(library: dict) -> str:
     return json.dumps(library, sort_keys=True)
 
 
-def missing_libraries(statuses: list, wanted) -> list:
-    """Work out which libraries still have to be asked for.
+def same_libraries(current, wanted) -> bool:
+    """Whether a policy already carries exactly the libraries the course names.
 
-    This is what makes ``cluster-ensure`` cheap on the second call. A library
-    already installed or on its way is left alone; one that failed is asked for
-    again, because a failed install does not retry on its own.
+    Compared as sorted keys, so order does not count as a difference. The order
+    a policy listing hands back has not been measured, and a shared policy
+    edited on every student's start because of an ordering quirk would be a
+    write per student that changes nothing.
     """
-    satisfied = set()
-    for entry in statuses or []:
-        library = entry.get("library")
-        if not isinstance(library, dict):
-            continue
-        if entry.get("status") in UNSATISFIED_LIBRARY_STATUSES:
-            continue
-        satisfied.add(library_key(library))
-    return [item for item in wanted if library_key(item) not in satisfied]
+    if not isinstance(current, list):
+        return False
+    return sorted(library_key(item) for item in current) == sorted(
+        library_key(item) for item in wanted
+    )
+
+
+def library_label(library: dict) -> str:
+    """Name a library the way ``VOC_COURSE_LIBRARIES`` would, for a message.
+
+    A failure message is read by a person comparing it against course.env, so
+    ``pypi:neo4j==6.2.0`` is what they can search for. The JSON form is the
+    fallback for a shape this does not know, which is better than a guess.
+    """
+    if isinstance(library, dict) and len(library) == 1:
+        kind, value = next(iter(library.items()))
+        if isinstance(value, dict):
+            value = value.get("package") or value.get("coordinates")
+        if isinstance(value, str) and value:
+            return f"{kind}:{value}"
+    return library_key(library)
+
+
+def describe_library_difference(listed, wanted: list) -> str:
+    """Say how a listed policy's libraries differ from the course's, briefly.
+
+    The difference rather than both lists, because twelve libraries twice is a
+    message nobody reads to the end, and the end is where the answer would be.
+    """
+    listed_keys = {library_key(item): item for item in listed or []}
+    wanted_keys = {library_key(item): item for item in wanted}
+    missing = [
+        library_label(wanted_keys[k]) for k in wanted_keys if k not in listed_keys
+    ]
+    extra = [library_label(listed_keys[k]) for k in listed_keys if k not in wanted_keys]
+    return (
+        f"missing from the policy: {', '.join(missing) or 'none'}; "
+        f"on the policy but not in the course: {', '.join(extra) or 'none'}"
+    )
 
 
 def find_cluster(workspace: Workspace, cluster_name: str) -> dict:
@@ -799,15 +891,143 @@ def find_cluster(workspace: Workspace, cluster_name: str) -> dict:
     Two clusters can share a name; the first match wins, as in the reference,
     and a duplicate is a thing to notice in the workspace rather than something
     this program can resolve.
+
+    Every page is read until the name turns up. The SDK pages this listing with
+    ``page_token`` and ``next_page_token``. Whether the 2.0 path pages, and at
+    what size, has not been measured. A cluster on page two read as absent would
+    get a second cluster created under the same name, so the token is followed
+    whenever one comes back. When none does, this is one request, as before.
+    No ``page_size`` is sent, because the first request must stay the one that
+    has always worked.
     """
+    path = "/api/2.0/clusters/list"
+    tokens_seen = set()
+    while True:
+        try:
+            payload = workspace.call("GET", path, idempotent=True)
+        except ApiError as error:
+            raise VoclabError("CLUSTER_LIST_FAILED", single_line(str(error))) from error
+        for cluster in payload.get("clusters") or []:
+            if cluster.get("cluster_name") == cluster_name:
+                return cluster
+        token = payload.get("next_page_token")
+        if not token:
+            return None
+        if token in tokens_seen:
+            # A token handed back twice would loop forever, and stopping quietly
+            # would call a cluster absent that may sit on a page never read.
+            raise VoclabError(
+                "CLUSTER_LIST_FAILED",
+                "clusters/list returned the same next_page_token twice, so the "
+                "listing could not be read to the end.",
+            )
+        tokens_seen.add(token)
+        path = "/api/2.0/clusters/list?" + urllib.parse.urlencode({"page_token": token})
+
+
+def cluster_policy_id(workspace: Workspace, cluster: dict, fields: dict) -> str:
+    """The ``policy_id`` a found cluster carries, read again when not listed.
+
+    Whether ``clusters/list`` reports ``policy_id`` has not been measured. If
+    it does not, every cluster found by name would look policy-free, and the
+    caller fails a student's lab for that. So a listing without the key is
+    checked against ``clusters/get`` before anything is concluded. Databricks
+    omits an empty field rather than sending it blank, so a ``get`` without the
+    key is the cluster genuinely carrying no policy.
+    """
+    if "policy_id" in cluster:
+        return cluster.get("policy_id") or ""
+    cluster_id = cluster.get("cluster_id")
+    query = urllib.parse.urlencode({"cluster_id": cluster_id})
     try:
-        payload = workspace.call("GET", "/api/2.0/clusters/list", idempotent=True)
+        detail = workspace.call(
+            "GET", f"/api/2.0/clusters/get?{query}", idempotent=True
+        )
     except ApiError as error:
-        raise VoclabError("CLUSTER_LIST_FAILED", single_line(str(error))) from error
-    for cluster in payload.get("clusters") or []:
-        if cluster.get("cluster_name") == cluster_name:
-            return cluster
-    return None
+        raise VoclabError(
+            "CLUSTER_GET_FAILED", single_line(str(error)), fields
+        ) from error
+    return detail.get("policy_id") or ""
+
+
+def check_cluster_libraries(
+    workspace: Workspace, cluster_id: str, wanted: list, fields: dict
+) -> None:
+    """Read where each of the course's libraries stands on a running cluster.
+
+    Only called on a cluster that was already RUNNING when this run found it.
+    Nothing here waits on a cluster, so a cluster created or started by this run
+    has nothing to read yet, and reading it would only ever say PENDING.
+
+    A library that FAILED or was SKIPPED stops the run as
+    ``LIBRARY_INSTALL_FAILED``, naming each one and the first line Databricks
+    gave for it. It will not arrive on its own, and a student who starts a lab
+    whose first import fails reports a broken notebook rather than a broken
+    library. Anything else is counted into ``fields`` and the run carries on:
+    ``library_status`` is ``installed`` when every library is, ``missing`` when
+    any is not listed at all, and ``pending`` otherwise.
+
+    ``libraries_missing`` is its own count because a library the cluster has
+    never heard of is not the same as one still installing. Whether a policy
+    edited after a cluster started reaches that cluster is open, and this count
+    is where it would show.
+    """
+    query = urllib.parse.urlencode({"cluster_id": cluster_id})
+    try:
+        payload = workspace.call(
+            "GET", f"/api/2.0/libraries/cluster-status?{query}", idempotent=True
+        )
+    except ApiError as error:
+        raise VoclabError(
+            "LIBRARY_STATUS_FAILED", single_line(str(error)), fields
+        ) from error
+
+    statuses = {}
+    for entry in payload.get("library_statuses") or []:
+        library = entry.get("library")
+        if isinstance(library, dict):
+            statuses[library_key(library)] = entry
+
+    installed = pending = missing = 0
+    failures = []
+    for library in wanted:
+        entry = statuses.get(library_key(library))
+        if entry is None:
+            missing += 1
+            continue
+        status = entry.get("status") or "UNKNOWN"
+        if status == INSTALLED_LIBRARY_STATUS:
+            installed += 1
+        elif status in FAILED_LIBRARY_STATUSES:
+            messages = entry.get("messages") or []
+            first = str(messages[0]).splitlines()[0] if messages else "no message"
+            failures.append(f"{library_label(library)} {status}: {first}")
+        else:
+            pending += 1
+
+    fields["libraries_installed"] = str(installed)
+    fields["libraries_pending"] = str(pending)
+    fields["libraries_missing"] = str(missing)
+    if failures:
+        fields["library_status"] = "failed"
+        raise VoclabError(
+            "LIBRARY_INSTALL_FAILED",
+            single_line(
+                f"{len(failures)} of {len(wanted)} libraries will not install on "
+                f"cluster {cluster_id}. " + "; ".join(failures)
+            ),
+            fields,
+        )
+    if missing:
+        fields["library_status"] = "missing"
+    elif pending:
+        fields["library_status"] = "pending"
+    else:
+        fields["library_status"] = "installed"
+    log(
+        f"libraries on {cluster_id}: {installed} installed, {pending} pending, "
+        f"{missing} not listed"
+    )
 
 
 def find_pool(workspace: Workspace, pool_name: str) -> dict:
@@ -889,51 +1109,166 @@ def resolve_pool(
     return pool_id
 
 
-def install_libraries(
-    workspace: Workspace, cluster_id: str, wanted, fields: dict
-) -> int:
-    """Ask for whatever libraries are not already accounted for.
+def find_policy(workspace: Workspace, policy_name: str, fields: dict) -> dict:
+    """Find a cluster policy by name, or return ``None``.
 
-    ``fields`` is passed in so that a failure here still carries the cluster
-    that was created, which is the difference between a next run that finds its
-    cluster and one that cannot tell whether it has one.
-
-    A course that asks for nothing costs nothing. Without the early return the
-    status read below still happens, which is a round trip in front of a student
-    that cannot change any answer.
+    The fourth function of this shape. A ``policy_id`` is minted by one
+    workspace and Vocareum makes a workspace per part, so the name is the only
+    key a course can rely on. ``fields`` is carried into the failure so that a
+    run that already found its cluster still reports it.
     """
+    try:
+        payload = workspace.call(
+            "GET", "/api/2.0/policies/clusters/list", idempotent=True
+        )
+    except ApiError as error:
+        raise VoclabError(
+            "LIBRARY_POLICY_FAILED", single_line(str(error)), fields
+        ) from error
+    for policy in payload.get("policies") or []:
+        if policy.get("name") == policy_name:
+            return policy
+    return None
+
+
+def ensure_library_policy(
+    workspace: Workspace, wanted: list, fields: dict
+) -> str | None:
+    """Make sure the shared library policy exists and carries ``wanted``.
+
+    Returns its ``policy_id``, or ``None`` when the course names no libraries.
+    That early return is what keeps a course that installs nothing exactly as it
+    was: no policy, no listing, and no round trip in front of a student that
+    could not change any answer.
+
+    Absent, it is created. Present with different libraries, it is edited, so a
+    course that changes ``VOC_COURSE_LIBRARIES`` between classes is not served
+    last class's list by a policy found by name. Present and equal, it is left
+    alone, which is the case every student after the first should hit.
+
+    A create that fails is followed by one more listing before it is reported.
+    The policy is the one object here shared by every student in the workspace,
+    so a class whose students all start at once on a fresh workspace races to
+    create it. Policy names are unique, so all but one of those creates fail,
+    and without the second look every loser would fail its student's lab over a
+    policy that now exists. Measured 2026-11-16, a second create under an
+    existing name is refused with ``INVALID_PARAMETER_VALUE``.
+
+    An edit is read back before it is believed. Measured, the listing returns
+    ``libraries``, but the shape it returns them in has not been compared with
+    the shape sent. If the two differ, every student's start would edit the
+    shared policy again and report it as ``updated``. A read-back that still
+    differs fails as ``LIBRARY_POLICY_FAILED`` on the first student, naming the
+    difference, rather than quietly on every one of them.
+
+    ``libraries_named`` is the number of libraries the course names, which is
+    all this function knows. Whether any reached the cluster is
+    ``check_cluster_libraries``'s to say.
+    """
+    fields["libraries_named"] = str(len(wanted))
     if not wanted:
-        log("this course names no libraries, so none were requested")
-        return 0
+        fields["library_policy"] = "none"
+        log("this course names no libraries, so no library policy is needed")
+        return None
 
-    try:
-        status = workspace.call(
-            "GET",
-            f"/api/2.0/libraries/cluster-status?cluster_id={cluster_id}",
-            idempotent=True,
+    policy = find_policy(workspace, LIBRARY_POLICY_NAME, fields)
+    if policy is None:
+        body = {
+            "name": LIBRARY_POLICY_NAME,
+            "definition": LIBRARY_POLICY_DEFINITION,
+            "libraries": wanted,
+        }
+        try:
+            created = workspace.call("POST", "/api/2.0/policies/clusters/create", body)
+        except ApiError as error:
+            policy = find_policy(workspace, LIBRARY_POLICY_NAME, fields)
+            if policy is None:
+                raise VoclabError(
+                    "LIBRARY_POLICY_FAILED", single_line(str(error)), fields
+                ) from error
+            log(f"policy {LIBRARY_POLICY_NAME} was created by another hook first")
+        else:
+            policy_id = created.get("policy_id")
+            if not policy_id:
+                raise VoclabError(
+                    "LIBRARY_POLICY_FAILED",
+                    "policies/clusters/create returned no policy_id.",
+                    fields,
+                )
+            fields["library_policy_action"] = "created"
+            log(f"created policy {LIBRARY_POLICY_NAME} ({policy_id})")
+            return policy_id
+
+    policy_id = policy.get("policy_id")
+    if not policy_id:
+        raise VoclabError(
+            "LIBRARY_POLICY_FAILED",
+            f"policy {LIBRARY_POLICY_NAME} was listed with no policy_id.",
+            fields,
         )
+    if same_libraries(policy.get("libraries"), wanted):
+        fields["library_policy_action"] = "kept"
+        log(f"policy {LIBRARY_POLICY_NAME} ({policy_id}) already carries them")
+        return policy_id
+
+    body = edit_body(policy, policy_id, wanted)
+    try:
+        workspace.call("POST", "/api/2.0/policies/clusters/edit", body, idempotent=True)
     except ApiError as error:
         raise VoclabError(
-            "LIBRARY_STATUS_FAILED", single_line(str(error)), fields
+            "LIBRARY_POLICY_FAILED", single_line(str(error)), fields
         ) from error
 
-    outstanding = missing_libraries(status.get("library_statuses"), wanted)
-    if not outstanding:
-        log("every library is already installed or on its way")
-        return 0
-
-    try:
-        workspace.call(
-            "POST",
-            "/api/2.0/libraries/install",
-            {"cluster_id": cluster_id, "libraries": outstanding},
-        )
-    except ApiError as error:
+    after = find_policy(workspace, LIBRARY_POLICY_NAME, fields)
+    listed = after.get("libraries") if after else None
+    if not same_libraries(listed, wanted):
         raise VoclabError(
-            "LIBRARY_INSTALL_FAILED", single_line(str(error)), fields
-        ) from error
-    log(f"requested {len(outstanding)} of {len(wanted)} libraries")
-    return len(outstanding)
+            "LIBRARY_POLICY_FAILED",
+            single_line(
+                f"policies/clusters/edit on {LIBRARY_POLICY_NAME} was accepted, "
+                "but the policy read back does not carry the course's libraries, "
+                "so every student would edit it again. "
+                + describe_library_difference(listed, wanted)
+                + "."
+            ),
+            fields,
+        )
+    fields["library_policy_action"] = "updated"
+    log(f"updated policy {LIBRARY_POLICY_NAME} ({policy_id}) to the course's list")
+    return policy_id
+
+
+# The fields of a listed policy an edit sends back unchanged. An edit replaces
+# the whole policy, so a field left out of the body is a field the edit clears.
+# Sending only the libraries would wipe a limit, a description or a per-user
+# cluster cap that somebody set on the shared policy by hand.
+POLICY_EDIT_CARRIED_FIELDS = (
+    "description",
+    "max_clusters_per_user",
+    "policy_family_id",
+    "policy_family_definition_overrides",
+)
+
+
+def edit_body(policy: dict, policy_id: str, wanted: list) -> dict:
+    """The ``policies/clusters/edit`` body that changes the libraries and only them.
+
+    The listed definition goes back, not ``LIBRARY_POLICY_DEFINITION``, and a
+    listing with no definition is an empty one, since Databricks omits an empty
+    field. A policy built from a policy family is the exception. Its listed
+    definition is the family's merged with the overrides, and the family and the
+    overrides are what define it, so the definition is not sent beside them.
+    Whether an edit sending both is refused is not measured. This policy is
+    created without a family, so the branch is reached only by a hand edit.
+    """
+    body = {"policy_id": policy_id, "name": LIBRARY_POLICY_NAME}
+    for name in POLICY_EDIT_CARRIED_FIELDS:
+        if policy.get(name) is not None:
+            body[name] = policy[name]
+    if "policy_family_id" not in body:
+        body["definition"] = policy.get("definition") or LIBRARY_POLICY_DEFINITION
+    body["libraries"] = wanted
+    return body
 
 
 def grant_restart(
@@ -1136,10 +1471,27 @@ def cluster_ensure(
     who is only waiting for their cluster to start would be a round trip that
     cannot change anything. So a record carrying no ``pool`` field is a record of
     a run that found its cluster already there.
+
+    The library policy is ensured on both branches, and it is attached only on
+    the create branch. A cluster found by name that does not carry it fails the
+    run as ``LIBRARY_POLICY_ABSENT``, before the cluster is started. It is not
+    attached here, because attaching a policy is a ``clusters/edit`` and an edit
+    restarts the student's cluster under them. It is not let through either: a
+    hook that exits 0 on a cluster without the course's libraries is a lab that
+    looks up and fails at its first import, with nothing saying why.
+
+    ``library_status`` says what this run could see of the libraries. ``none``
+    is a course that names none. ``not_checked`` is a cluster this run created
+    or started, which has nothing installed yet. Otherwise the cluster was
+    already RUNNING, and ``check_cluster_libraries`` read it. That read happens
+    after ``grant_restart``, so a student whose libraries failed can at least
+    restart the cluster they were given.
     """
     cluster_name = cluster_name_for(user_email)
     existing = find_cluster(workspace, cluster_name)
     fields = {"cluster_name": cluster_name}
+    wanted = course_libraries() if libraries is None else list(libraries)
+    policy_id = None
 
     if existing is None:
         instance_pool_id = resolve_pool(workspace, pool_name, spark_version, fields)
@@ -1151,6 +1503,11 @@ def cluster_ensure(
             spark_version,
             fields,
         )
+        # After the preflight, so a runtime the workspace does not offer stops
+        # the run before it writes to an object every student shares.
+        policy_id = ensure_library_policy(workspace, wanted, fields)
+        if policy_id:
+            fields["library_policy"] = policy_id
         settings = cluster_settings(
             cluster_name=cluster_name,
             user_email=user_email,
@@ -1160,6 +1517,7 @@ def cluster_ensure(
             catalog=catalog,
             tags=tags,
             instance_pool_id=instance_pool_id,
+            policy_id=policy_id,
         )
         try:
             created = workspace.call("POST", "/api/2.0/clusters/create", settings)
@@ -1181,6 +1539,28 @@ def cluster_ensure(
         cluster_id = existing.get("cluster_id")
         state = existing.get("state") or "UNKNOWN"
         fields["cluster_id"] = cluster_id
+        # Before the start, so a cluster this run is about to fail is not also
+        # one it set billing. Ensured here as well as on the create branch, so a
+        # course that changed its list still updates the shared policy.
+        policy_id = ensure_library_policy(workspace, wanted, fields)
+        if policy_id:
+            carried = cluster_policy_id(workspace, existing, fields)
+            if carried != policy_id:
+                raise VoclabError(
+                    "LIBRARY_POLICY_ABSENT",
+                    single_line(
+                        f"Cluster {cluster_name} carries "
+                        f"{'policy ' + carried if carried else 'no policy'}, not "
+                        f"{LIBRARY_POLICY_NAME} ({policy_id}), so the course's "
+                        f"{len(wanted)} libraries will not reach it. Attaching "
+                        "the policy would restart the cluster, so this run did "
+                        f"not. To fix it, delete the student's cluster "
+                        f"{cluster_name} and restart the lab, which creates it "
+                        "again with the policy."
+                    ),
+                    fields,
+                )
+            fields["library_policy"] = policy_id
         if state in LIVE_CLUSTER_STATES:
             action = "running"
             log(f"cluster {cluster_name} ({cluster_id}) is already {state}")
@@ -1204,12 +1584,16 @@ def cluster_ensure(
     fields["cluster_state"] = state
     fields["cluster_action"] = action
 
-    wanted = course_libraries() if libraries is None else list(libraries)
-    requested = install_libraries(workspace, cluster_id, wanted, fields)
-    fields["libraries_requested"] = str(requested)
-
     grant_restart(workspace, cluster_id, user_email, fields)
     fields["granted_to"] = user_email
+
+    if not policy_id:
+        fields["library_status"] = "none"
+    elif action == "running" and state == "RUNNING":
+        check_cluster_libraries(workspace, cluster_id, wanted, fields)
+    else:
+        fields["library_status"] = "not_checked"
+        log(f"cluster {cluster_name} is {state}, so its libraries were not read")
     return fields
 
 
@@ -1928,6 +2312,157 @@ def normalize_host(value: str) -> str:
     return text.rstrip("/")
 
 
+# --- token-probe -------------------------------------------------------------
+#
+# A diagnostic that no hook calls. It answers two questions about the credential
+# a hook holds: whose identity it carries, and what it may do. The beacon cannot
+# answer either, because ``voc_beacon_variables`` prints names and never values.
+#
+# It is meant to run from ``workspace_init.sh`` for one ``Rerun Init``. That
+# hook's stderr reaches the ``Init Exit Status`` transcript on the admin
+# Workspaces page, which needs no student session, so the measurement costs no
+# session at all. ``docs/permissions.md`` holds what it measured.
+
+# Every call is a GET, and that is load bearing rather than tidy. A probe run
+# from ``workspace_init.sh`` that created anything would bill for a question
+# nobody has to answer, and bill again on every Rerun Init.
+#
+# ``token/list`` is here for a different reason than the rest. The others are
+# things a hook already needs to do. That one bears on what ``enable_tokens`` in
+# the part's ``.cfg`` turns on, which is open, and the same run reads it.
+TOKEN_PROBE_OPERATIONS = (
+    ("identity", "/api/2.0/preview/scim/v2/Me"),
+    ("clusters_list", "/api/2.0/clusters/list"),
+    ("instance_pools_list", "/api/2.0/instance-pools/list"),
+    ("warehouses_list", "/api/2.0/sql/warehouses"),
+    ("catalogs_list", "/api/2.1/unity-catalog/catalogs"),
+    ("workspace_list", "/api/2.0/workspace/list?path=%2F"),
+    ("groups_list", "/api/2.0/preview/scim/v2/Groups?count=1"),
+    ("tokens_list", "/api/2.0/token/list"),
+)
+
+# Names only. A probe that printed a credential into a transcript an instructor
+# forwards would be a worse outcome than the question staying open.
+TOKEN_PROBE_CREDENTIAL_VARS = (
+    "VOC_DB_API_TOKEN",
+    "VOC_DB_SP_APPLICATION_ID",
+    "VOC_DB_SP_SECRET",
+    "DATABRICKS_TOKEN",
+)
+
+
+def token_probe_verdict(error: ApiError) -> str:
+    """Name what one refused call proves, in ``probe.py``'s vocabulary.
+
+    The same words on purpose. The two instruments measure one workspace from
+    opposite sides, and a reader comparing a hook's transcript against
+    ``docs/permissions.md`` should not have to translate between two spellings
+    of the same finding.
+
+    ``NOT_FOUND_OR_HIDDEN`` stays distinct from a denial for the reason that
+    governs the whole design: Databricks reports "you may not see this" as "this
+    does not exist", so a 404 is an unknown rather than a refusal, and recording
+    it as denied would be a measurement this file did not make.
+    """
+    detail = error.detail
+    if "HTTP 401" in detail:
+        return "UNAUTHENTICATED"
+    if "HTTP 403" in detail:
+        # Unity Catalog refuses through its own error code rather than through
+        # the workspace ACL, and which of the two refused decides where the fix
+        # goes, so the distinction is kept rather than flattened to "denied".
+        if "UNITY_CATALOG" in detail or "/unity-catalog/" in str(error):
+            return "UNITY_CATALOG_DENIED"
+        return "PERMISSION_DENIED"
+    if "HTTP 404" in detail:
+        return "NOT_FOUND_OR_HIDDEN"
+    match = re.search(r"HTTP (\d{3})", detail)
+    return f"ERROR_{match.group(1)}" if match else "UNREACHABLE"
+
+
+def token_probe_reading(payload: dict) -> str:
+    """Tell an allowed call that returned nothing from one that returned rows.
+
+    A list endpoint returns only what the caller may see, so an empty list is
+    two facts wearing one shape: permitted and empty, or permitted to ask and
+    shown nothing. ``ALLOWED_EMPTY`` says which claim was actually earned.
+    """
+    if not payload:
+        return "ALLOWED_EMPTY"
+    for value in payload.values():
+        if isinstance(value, list) and not value:
+            return "ALLOWED_EMPTY"
+    return "ALLOWED"
+
+
+def token_probe(workspace: Workspace, source: str) -> dict:
+    """Measure one credential against the calls a hook makes, and never fail.
+
+    Never failing is the point rather than a convenience. ``workspace_init.sh``
+    runs under ``set -e``, so a subcommand that raised on a denied call would
+    take the whole workspace build down over a question that was optional.
+    Every outcome here is a reading, including the refusals, so the exit status
+    stays ``0`` and the answer reaches the hook either way.
+
+    Identity is read first because the rest is uninterpretable without it. A row
+    saying ``clusters_list=ALLOWED`` is worth nothing until you know which
+    principal was allowed, and the two are easy to report separately and read as
+    though they were about the same account.
+    """
+    fields = {
+        "token_probe_source": source,
+        "token_probe_credentials_set": ",".join(
+            name
+            for name in TOKEN_PROBE_CREDENTIAL_VARS
+            if os.environ.get(name, "").strip()
+        )
+        or "none",
+        # Seeded rather than written only on success, so that a refused identity
+        # call still produces the field. An omitted key reaches the shell as an
+        # empty variable, which reads the same as a probe that never asked, and
+        # those are two different facts about a credential.
+        "token_probe_identity_name": "unknown",
+        "token_probe_identity_id": "unknown",
+    }
+
+    for field, path in TOKEN_PROBE_OPERATIONS:
+        try:
+            payload = workspace.call("GET", path, idempotent=True)
+        except ApiError as error:
+            fields[f"token_probe_{field}"] = token_probe_verdict(error)
+            continue
+        fields[f"token_probe_{field}"] = token_probe_reading(payload)
+        if field == "identity":
+            # Beside the verdict rather than instead of it, because "the call
+            # was allowed" and "it came back as this principal" are the two
+            # halves of the question and a run can produce one without the other.
+            fields["token_probe_identity_name"] = payload.get("userName") or "unknown"
+            fields["token_probe_identity_id"] = str(payload.get("id") or "unknown")
+
+    log(
+        "token-probe measured "
+        f"{len(TOKEN_PROBE_OPERATIONS)} read-only calls as "
+        f"{fields['token_probe_identity_name']}"
+    )
+    return fields
+
+
+def token_probe_source(args: argparse.Namespace) -> str:
+    """Say which variable supplied the credential, mirroring ``build_workspace``.
+
+    Without this the whole measurement is ambiguous. A host with no
+    ``VOC_DB_API_TOKEN`` falls through to ``DATABRICKS_TOKEN``, and the run then
+    reports a real, correct answer about the wrong principal, which is the exact
+    failure the laptop probe's credential guard exists to prevent.
+    """
+    if args.token:
+        return "--token"
+    for name in ("VOC_DB_API_TOKEN", "DATABRICKS_TOKEN"):
+        if os.environ.get(name, "").strip():
+            return name
+    return "none"
+
+
 def build_workspace(args: argparse.Namespace) -> Workspace:
     """Resolve the credential, preferring what Vocareum hands the hook.
 
@@ -2220,6 +2755,14 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[shared],
         help="Permanently delete the cluster, for a terminate.",
     )
+    subcommands.add_parser(
+        "token-probe",
+        parents=[shared],
+        help=(
+            "Measure what the hook's credential may do, read-only. "
+            "A diagnostic, not part of any lifecycle."
+        ),
+    )
     return parser
 
 
@@ -2234,6 +2777,12 @@ def run(args: argparse.Namespace) -> dict:
     fail the hook over a value nothing was going to use.
     """
     workspace = build_workspace(args)
+
+    # Before the student is resolved, like the two warehouse commands and for
+    # the same reason: it runs from ``workspace_init.sh``, where no
+    # VOC_DB_USER_EMAIL exists yet.
+    if args.command == "token-probe":
+        return token_probe(workspace, token_probe_source(args))
 
     if args.command == "starter-warehouse":
         # No size named means leave it alone, and say so. Unlike every other

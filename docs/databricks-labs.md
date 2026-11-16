@@ -78,6 +78,8 @@ The output is not discarded, though. It goes somewhere no program can reach.
 
 Every session carries a **Session log** in the Vocareum console. It records the LAUNCH, START, INIT, and END transitions, and for a lifecycle script that exits non-zero it carries the **exit code and the captured output**. It is per session, it is read by hand, and it is the only place a script's own words survive. **So when a lab fails, open the Session log first.** [`diagnosing.md`](diagnosing.md#open-the-session-log-before-you-run-anything) quotes a real one, and covers the separate Init log that `workspace_init.sh` writes to.
 
+`workspace_init.sh` is the one hook whose words can be read without a student. Its stderr reaches the `Init Exit Status` transcript on the admin Workspaces page, and `Rerun Init` runs it again. That makes it the place to measure a hook's credential. `voclab.py token-probe` does that with eight read-only calls. [`permissions.md`](permissions.md#the-credential-a-hook-runs-under) holds the method and the result.
+
 ### `voccustomdata.txt`, which the next hook reads
 
 A script writes flat JSON to `voccustomdata.txt` in its working directory. Vocareum's contract says it does three things with it: forwards it to the next script in the sequence as `VOC_CUSTOM_DATA`, reads `error_code` and `message` out of it when the script exits non-zero, and carries it in the session record.

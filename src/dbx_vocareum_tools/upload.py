@@ -316,6 +316,12 @@ def collect_directory(source: Path) -> list[Member]:
     generated elsewhere in its repository should be able to point at it once
     rather than keep a second copy that drifts. ``seen`` holds resolved paths so
     a link back to an ancestor stops rather than recurses forever.
+
+    Anything that is neither a directory nor a file is refused rather than
+    skipped. A broken symlink is the case that forced this: a course renamed the
+    folder its ``lab/Lab_1_Aura_Setup`` link pointed at, and the old walk
+    dropped the link with no message. The upload would then verify by hash and
+    ship a lab missing that folder. A refusal that names the path is the fix.
     """
     members: list[Member] = []
     seen: set[Path] = set()
@@ -332,6 +338,16 @@ def collect_directory(source: Path) -> list[Member]:
                 walk(item)
             elif item.is_file():
                 members.append(read_member(item, item.relative_to(source).as_posix()))
+            elif item.is_symlink():
+                raise ConfigError(
+                    f"{item} is a symlink to {item.readlink()}, which does not "
+                    "exist. Fix or remove the link before uploading."
+                )
+            else:
+                raise ConfigError(
+                    f"{item} is neither a file nor a directory, so it cannot be "
+                    "uploaded. Remove it before uploading."
+                )
 
     walk(source)
     return members

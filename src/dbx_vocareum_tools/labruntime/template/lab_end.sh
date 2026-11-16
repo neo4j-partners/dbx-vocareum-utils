@@ -107,6 +107,10 @@ cleanup_error=""
 # stop the billing, which is the part that matters: Vocareum does not reclaim a
 # cluster it did not create.
 #
+# Neither touches the voc-course-libraries cluster policy, and nothing here may.
+# cluster-ensure keeps one per workspace and every student's cluster carries it,
+# so deleting it when one student leaves strips the libraries from the next.
+#
 # Not so that the next session finds the stopped cluster by name and skips the
 # library install. It cannot. The cluster is named after the local part of the
 # lab identity, Vocareum mints that identity per session, and its local part

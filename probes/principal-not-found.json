@@ -1,0 +1,60 @@
+[
+  {
+    "operation": "scim:Me",
+    "note": "COPY-AND-FILL TEMPLATE. The paths below hold ${DATABRICKS_WORKSPACE_ID}, ${VOC_GROUP_ID} and ${VOC_LAB_USER_ID}, and dbx-vocareum-probe refuses this file until each is replaced in a copy. ${VOC_GROUP_ID} and ${VOC_LAB_USER_ID} are the workspace SCIM ids of one session's Group-lab-* group and labuser* user, which dbx-vocareum-diagnose --principals prints. Read them before ending the session, because ending it revokes both. This probe records which identity took the readings below. The three guards have already run by this point."
+  },
+  {
+    "operation": "permission-assignment:List",
+    "method": "GET",
+    "path": "/api/2.0/accounts/{account_id}/workspaces/${DATABRICKS_WORKSPACE_ID}/permissionassignments",
+    "scope": "account",
+    "note": "The call the 'add user to workspace' error names. OK means the workspace is identity federated and the account permission-assignment plane applies to it. FEATURE_DISABLED, or not-found against the endpoint itself, means it is not. ALLOWED_EMPTY does not mean there are no assignments: looks_empty inspects only collection-valued members, so this probe answers whether the endpoint answers, never who is in the list. dbx-vocareum-diagnose --principals answers membership."
+  },
+  {
+    "operation": "permission-assignment:ListPreview",
+    "method": "GET",
+    "path": "/api/2.0/preview/accounts/{account_id}/workspaces/${DATABRICKS_WORKSPACE_ID}/permissionassignments",
+    "scope": "account",
+    "note": "The documented preview shape of the same call. Running both separates 'this workspace does not do permission assignment' from 'this account answers on the other path shape', which otherwise look the same."
+  },
+  {
+    "operation": "permission-assignment:AssignablePermissions",
+    "method": "GET",
+    "path": "/api/2.0/accounts/{account_id}/workspaces/${DATABRICKS_WORKSPACE_ID}/permissionassignments/permissions",
+    "scope": "account",
+    "note": "An independent federation test. An empty assignment list and an unavailable endpoint look alike; this call tells them apart. USER and ADMIN coming back means federation is on and an empty assignment list is really empty."
+  },
+  {
+    "operation": "account:GetGroupById",
+    "method": "GET",
+    "path": "/api/2.0/accounts/{account_id}/scim/v2/Groups/${VOC_GROUP_ID}",
+    "scope": "account",
+    "note": "The session's workspace group, asked of the account plane. NOT_FOUND_OR_HIDDEN is the condition the error message reports, so only trust it if account:ListGroups below is ALLOWED. OK means the group exists on the account plane. Neither answer shows which id Vocareum passed, because that happens inside Vocareum."
+  },
+  {
+    "operation": "account:GetUserById",
+    "method": "GET",
+    "path": "/api/2.0/accounts/{account_id}/scim/v2/Users/${VOC_LAB_USER_ID}",
+    "scope": "account",
+    "note": "The same question for the session's lab user, by its workspace-level id. OK means one id resolves on both planes, which is what identity federation looks like. NOT_FOUND_OR_HIDDEN means the workspace id is not an account id, so the two planes hold different principals."
+  },
+  {
+    "operation": "account:GetWorkspace",
+    "method": "GET",
+    "path": "/api/2.0/accounts/{account_id}/workspaces/${DATABRICKS_WORKSPACE_ID}",
+    "scope": "account",
+    "note": "creation_time is the earliest moment error_info can date from, because error_info carries no timestamp of its own. pricing_tier matters because the permission assignment API is not on every tier. workspace_status_message is a second Databricks-side error channel, independent of Vocareum's error_info."
+  },
+  {
+    "operation": "account:ListWorkspaces",
+    "note": "Every voc-ws-* workspace in the account, so the readings above can be checked against the workspace they were meant for."
+  },
+  {
+    "operation": "account:ListGroups",
+    "note": "A control: whether this principal can read the account group plane at all. If it cannot, every NOT_FOUND_OR_HIDDEN above is unreadable as evidence, because a principal with no permission is told the object does not exist."
+  },
+  {
+    "operation": "account:ListUsers",
+    "note": "The same control for the account user plane."
+  }
+]

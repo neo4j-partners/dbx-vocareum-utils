@@ -235,6 +235,20 @@ def test_a_symlinked_directory_is_followed(tmp_path: Path) -> None:
     ]
 
 
+def test_a_broken_symlink_is_refused_by_name(tmp_path: Path) -> None:
+    """Measured on a course: lab/Lab_1_Aura_Setup pointed at a renamed folder
+    and the upload dropped it with no message. Skipping is the failure."""
+    source = tmp_path / "lab"
+    source.mkdir()
+    write_script(source, "user_setup.sh")
+    link = source / "Lab_1_Aura_Setup"
+    link.symlink_to(tmp_path / "renamed_away", target_is_directory=True)
+
+    with pytest.raises(ConfigError, match="Lab_1_Aura_Setup") as raised:
+        collect_members([source], None)
+    assert "renamed_away" in str(raised.value)
+
+
 def test_a_symlink_loop_stops_rather_than_recursing(tmp_path: Path) -> None:
     """Following symlinks buys the single-copy layout and costs a cycle risk."""
     source = tmp_path / "lab"

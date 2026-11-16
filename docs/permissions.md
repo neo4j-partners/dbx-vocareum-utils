@@ -154,9 +154,64 @@ So an instructor holding these credentials can run the `dbx-vocareum-pool` runbo
 
 The workspace guard was tested on purpose, with `--probe scim:Me --expect-workspace-id 0`. It refused, exited 2, and reported no probe results: "Host guard refused the run. Expected workspace 0, reached ${DATABRICKS_WORKSPACE_ID}." A tool that measured the wrong workspace and printed results anyway would be worse than one that failed, so this refusal matters as much as the table above it.
 
+#### Libraries on a `SINGLE_USER` cluster
+
+Measured 2026-11-16 as the service principal `${DATABRICKS_CLIENT_ID}`, against a live student cluster created by `cluster-ensure`. That cluster is `SINGLE_USER`, and its single user is the lab identity `${DATABRICKS_LAB_USER_EMAIL}`. The install was made with the hook's `VOC_DB_API_TOKEN`, which carries the service principal per [the next section](#the-credential-a-hook-runs-under). These are writes, so they are not in the probe catalog.
+
+| Operation | Status | Measured by |
+| --- | --- | --- |
+| `libraries:Install` on that cluster | Denied | `PERMISSION_DENIED`. See below |
+| `policies:Create` with `definition` `"{}"` and a `libraries` list | Allowed | Returned a `policy_id` |
+| `clusters:Edit` attaching that `policy_id` to the same cluster | Allowed | The cluster restarted, and Databricks installed the policy's libraries itself |
+| `policies:Create` a second time under a name that already exists | Refused | `INVALID_PARAMETER_VALUE`, `Cluster Policy with name ${POLICY_NAME} already exists` |
+| `policies:List` | Allowed | A policy with libraries is listed with a `libraries` key holding all 12. A policy without libraries omits the key |
+| `libraries:ClusterStatus` on a cluster carrying the policy | Allowed | The policy's libraries are listed like any other, as `PENDING` and then `INSTALLED` |
+| `policies:Edit` with a `requirements` library, `{"requirements": "<workspace path>"}` | Allowed | The listing returns it exactly as sent |
+| `clusters:List` and `clusters:Get` on a cluster created with `policy_id` | Allowed | Both report the cluster's `policy_id` |
+| `policies:Create` with one `maven`, one `requirements` and one `whl` library, then `policies:List` | Allowed | The listed `libraries` equal what was sent: same entries, same order, no added keys. `pypi` was not in this set, so its round trip is not compared exactly |
+| `clusters:Create` with `policy_id` naming a policy with one `maven` and one `requirements` library | Allowed | Databricks installed both with no other call. The cluster reached `RUNNING` at 488 seconds and both libraries reached `INSTALLED` 122 seconds after that |
+| `clusters:Create` with `policy_id` naming a policy with one `maven`, one `requirements` library at a `/Volumes` path and one `whl` at a `/Volumes` path | Allowed | Databricks installed all three with no other call. The cluster reached `RUNNING` at 508 seconds and all three reached `INSTALLED` 142 seconds after that. Maven finished at about 60 seconds after `RUNNING`, the `requirements` file at about 120, the wheel at about 142 |
+
+The refusal reads: `PERMISSION_DENIED: Single-user check failed: user '${DATABRICKS_CLIENT_ID}' attempted to run a command on single-user cluster ${CLUSTER_ID}, but the single user of this cluster is '${DATABRICKS_LAB_USER_EMAIL}'.` It was measured twice. The first try carried the course's full list of 12 libraries. The second carried the same list with the Volume wheel removed. Both were refused identically, so the check refuses any library install, not one library. Account admin does not get past it. Whether this install ever succeeded on such a cluster is open. Databricks release notes for October and November 2026 name no change that would explain it, so it is not recorded as a regression.
+
+The policy route was measured as the same principal. After the edit, no call ran as the student and no single-user check fired. The Maven connector and 6 PyPI packages reached `INSTALLED` within about 3 minutes of `RUNNING`. `voclab.py` takes this route, and `src/dbx_vocareum_tools/labruntime/README.md` describes it.
+
+Policy names are unique, by the refused second create above. `cluster-ensure` relies on that: a class starting together on a fresh workspace races to create the one policy, and every loser lists again and uses the winner.
+
+These questions about it are open:
+
+- **Five libraries stalled.** `databricks-langchain>=0.20.0` and the 4 libraries queued after it stayed `PENDING` for 25 minutes and more. Databricks described each as attempted on the driver node but not yet finished. The cause is not known.
+- **Whether a policy edit reaches a cluster that already exists is not measured.** A course that changes `VOC_COURSE_LIBRARIES` edits the shared policy. A student cluster created before the edit may keep the old list. `cluster-ensure` counts such a library as `libraries_missing`.
+- **Whether the lab user can restart the cluster with `CAN_RESTART` alone is not measured.** That grant is all `cluster-ensure` gives the student. A restart is how a student retries a library that failed.
+- **A pool and a policy together is not measured.** A pooled `clusters/create` carries both `instance_pool_id` and `policy_id`. The empty definition should constrain nothing, but no pooled cluster has been created with the policy.
+
 #### The credential a hook runs under
 
 Vocareum hands each hook `VOC_DB_API_TOKEN`. Measured from inside a running `workspace_init.sh`, it authenticates, and `scim/v2/Me` returns the service principal's identity, `${DATABRICKS_CLIENT_ID}`. Eight read-only calls were allowed: SCIM `Me` and groups, clusters, instance pools, SQL warehouses, Unity Catalog catalogs, the workspace tree, and the token list. `DATABRICKS_TOKEN` was not set, so these verdicts belong to that token and not to a fallback credential.
+
+| Operation | Verdict |
+| --- | --- |
+| `GET /api/2.0/preview/scim/v2/Me` | `ALLOWED` |
+| `GET /api/2.0/clusters/list` | `ALLOWED_EMPTY` |
+| `GET /api/2.0/instance-pools/list` | `ALLOWED` |
+| `GET /api/2.0/sql/warehouses` | `ALLOWED` |
+| `GET /api/2.1/unity-catalog/catalogs` | `ALLOWED` |
+| `GET /api/2.0/workspace/list?path=%2F` | `ALLOWED` |
+| `GET /api/2.0/preview/scim/v2/Groups?count=1` | `ALLOWED` |
+| `GET /api/2.0/token/list` | `ALLOWED` |
+
+**The instrument is `voclab.py token-probe`.** It makes the eight GETs in `TOKEN_PROBE_OPERATIONS` with the hook's credential and returns one `token_probe_<call>` field per call. The verdicts use `probe.py`'s words, so a transcript and this page read alike. A refused call is a reading, not a failure, so the subcommand still exits 0. It does not exit 0 when no token is set at all. Workspace setup runs before any call and fails with `MISSING_API_TOKEN`. It also returns `token_probe_source`, the variable the token came from, and `token_probe_credentials_set`, the credential variables that were set. Both are names only. On the run above, the source was `VOC_DB_API_TOKEN`, and the set held `VOC_DB_API_TOKEN`, `VOC_DB_SP_APPLICATION_ID` and `VOC_DB_SP_SECRET`.
+
+No hook calls it. To measure again, add these lines to `workspace_init.sh`, upload, and press `Rerun Init`:
+
+```bash
+voc_voclab token-probe || true
+for v in $(compgen -v voclab_); do voc_log "$v=${!v}"; done
+```
+
+The `|| true` matters because the hooks run under `set -euo pipefail`. Without it, the no-token case aborts the workspace build, and that is the case the probe exists to show. The loop logs every `voclab_*` variable, not only the `token_probe_` ones. With no token, the call returns only `voclab_error_code` and `voclab_message`, and those are the reading that matters then. The loop has to come straight after the call. The next `voc_voclab` call clears every `voclab_*` variable, and under `set -u` reading a cleared one is fatal. The loop works on bash 3.2.
+
+The verdicts appear in the `Init Exit Status` transcript on the admin Workspaces page, which needs no student session. Remove the lines afterwards.
 
 **Same identity implies the same ceiling, and that step is an inference.** Databricks authorizes by principal, so the 24-operation table above should describe this credential too. Eight calls were measured and twenty-four were not. Measure any specific operation a hook needs rather than reading it off that table. The beacon's `vars` list shows `user_setup.sh` is handed a variable of the same name. Whether its value carries the same identity there was not measured, which is why `voc_detect_credential` runs in each hook.
 
